@@ -11,8 +11,7 @@ class App(ctk.CTk):
         super().__init__()
         self.title("G-Vision OCR")
         self.geometry("800x600")
-
-        # левая колонка - загрузка и кнопки
+        
         self.left = ctk.CTkFrame(self, width=200)
         self.left.pack(side="left", fill="y", padx=10, pady=10)
 
@@ -28,7 +27,6 @@ class App(ctk.CTk):
         self.status = ctk.CTkLabel(self.left, text="готов к работе", wraplength=180)
         self.status.pack(pady=10, padx=10)
 
-        # правая часть - превью и результат
         self.right = ctk.CTkFrame(self)
         self.right.pack(side="right", fill="both", expand=True, padx=10, pady=10)
 
@@ -55,7 +53,7 @@ class App(ctk.CTk):
             self.status.configure(text="сначала загрузи фото")
             return
         self.status.configure(text="распознаю...")
-        # тут подключи свою модель
+        # тут подключается модель
         # from train_garrisen import GVisionOCR
         # ocr = GVisionOCR("g-vision-final.pt", "g-vision-config.json")
         # result = ocr.recognize(self.image_path)
