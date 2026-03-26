@@ -1,0 +1,28 @@
+# G-Vision OCR Application Requirements
+# Python 3.10+
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.9.0
+
+# Object Detection & YOLO
+ultralytics>=8.0.0
+
+# Data Processing
+numpy>=1.21.0
+Pillow>=9.0.0
+opencv-python>=4.5.0
+tqdm>=4.60.0
+
+# Config & Serialization
+PyYAML>=5.4
+pyyaml>=5.4
+
+# UI Framework
+customtkinter>=5.0.0
+
+# Optional: For development and testing
+# pytest>=7.0.0
+# black>=22.0.0
+# pylint>=2.0.0
