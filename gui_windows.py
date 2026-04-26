@@ -1,5 +1,6 @@
 """G-Vision OCR - Windows Version"""
 import sys
+import json
 import customtkinter as ctk
 from tkinter import filedialog, Label
 from PIL import Image, ImageTk
@@ -138,10 +139,12 @@ class App(ctk.CTk):
             self.image_path = None
             self.is_processing = False
             self.current_image = None
+            self.ocr = None
 
             self._build_sidebar()
             self._build_content()
             self._setup_shortcuts()
+            self._init_ocr()
 
             logger.info("App initialized successfully")
         except Exception as e:
@@ -149,7 +152,7 @@ class App(ctk.CTk):
             raise
 
     def _build_title_bar(self):
-        """Create custom title bar with minimize and close buttons"""
+        """Create custom title bar"""
         title_bar = ctk.CTkFrame(self, fg_color="#0a0a0a", height=40)
         title_bar.pack(side="top", fill="x", padx=0, pady=0)
         title_bar.pack_propagate(False)
@@ -201,12 +204,12 @@ class App(ctk.CTk):
         app_label.bind("<B1-Motion>", self._on_title_drag)
 
     def _on_title_press(self, event):
-        """Start window movement"""
+        """Start moving window"""
         self._drag_data["x"] = event.x_root
         self._drag_data["y"] = event.y_root
 
     def _on_title_drag(self, event):
-        """Move window during drag"""
+        """Move window while dragging"""
         dx = event.x_root - self._drag_data["x"]
         dy = event.y_root - self._drag_data["y"]
         x = self.winfo_x() + dx
@@ -362,10 +365,61 @@ class App(ctk.CTk):
         self.current_image = ctk_img
         self.image_label._current_image = ctk_img
 
+    def _init_ocr(self):
+        """Initialize OCR model from best.pt or g-vision-config.json."""
+        try:
+            root_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(root_dir, "best.pt")
+            config_path = os.path.join(root_dir, "g-vision-config.json")
+            config_model_path = None
+
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    model_from_cfg = cfg.get("model")
+                    if model_from_cfg:
+                        candidate = model_from_cfg if os.path.isabs(model_from_cfg) else os.path.join(root_dir, model_from_cfg)
+                        if os.path.exists(candidate):
+                            config_model_path = candidate
+                except Exception as ex:
+                    logger.warning(f"Failed to load OCR config: {ex}")
+
+            if config_model_path and os.path.exists(config_model_path):
+                model_path = config_model_path
+
+            if not os.path.exists(model_path):
+                fallback_paths = [
+                    os.path.join(root_dir, "best_model.pt"),
+                    os.path.join(root_dir, "G-Vision.pt"),
+                    os.path.join(root_dir, "G-VISION.pt"),
+                    os.path.join(root_dir, "best.pt"),
+                    os.path.join(root_dir, "runs", "ocr_final", "best_model.pt")
+                ]
+                for p in fallback_paths:
+                    if os.path.exists(p):
+                        model_path = p
+                        break
+
+            if not os.path.exists(model_path):
+                self._set_status("OCR model not found", "#e74c3c")
+                logger.warning(f"OCR model not found: {model_path}")
+                return
+
+            config_arg = config_path if os.path.exists(config_path) else None
+            from train import GVisionOCR
+            self.ocr = GVisionOCR(model_path, config_arg)
+            self._set_status("OCR model loaded", "#2ecc71")
+            logger.info(f"OCR model initialized from {model_path}, config {config_arg}")
+        except Exception as e:
+            logger.error(f"Error initializing OCR model: {e}", exc_info=True)
+            self.ocr = None
+            self._set_status("OCR loading error", "#e74c3c")
+
     def _init_animation_indicator(self):
         """Initialize small animated indicator"""
         try:
-            video_path = os.path.join(os.path.dirname(__file__), "0001-0048.mkv")
+            video_path = os.path.join(os.path.dirname(__file__), "wait_anim.mkv")
             if os.path.exists(video_path):
                 self.animation_indicator = AnimationIndicator(video_path, size=32)
                 logger.info(f"Animation indicator initialized with {self.animation_indicator.get_frames_count()} frames")
@@ -498,14 +552,19 @@ class App(ctk.CTk):
 
         def process():
             try:
-                import time
-                time.sleep(2)
-                text = "Recognition result will be here...\n\n(Connect OCR module from train.py)"
+                if self.ocr is None:
+                    raise RuntimeError("OCR model not initialized")
+
+                result = self.ocr.recognize(self.image_path)
+                text = result.get("text", "")
+                if not text:
+                    text = "No text found. Check the image quality and model."
+
                 logger.info("Recognition completed successfully")
                 self.after(0, lambda: self._show_result(text))
             except Exception as e:
                 logger.error(f"Error during recognition: {e}", exc_info=True)
-                self.after(0, lambda: self._show_result(f"Recognition error: {str(e)[:40]}\nTry again"))
+                self.after(0, lambda: self._show_result(f"Recognition error: {str(e)[:80]}. Try again."))
 
         thread = threading.Thread(target=process, daemon=True)
         thread.start()
@@ -546,7 +605,7 @@ class App(ctk.CTk):
         logger.info("Application cleared")
 
     def _set_status(self, text, color="#6a8a7a"):
-        """Update status in interface"""
+        """Update status in the interface"""
         self.status_label.configure(text=text, text_color=color)
 
 
