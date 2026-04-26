@@ -1,90 +1,82 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+G-VISION OCR — Dataset Generator
 
-# генератор всего датасета - буквы цифры пунктуация слова предложения
-# ОПТИМИЗИРОВАНО ДЛЯ MACBOOK AIR M1: 16 процессов, spawn context, быстрые операции
-# Запуск: python3 generate.py
-#   Data-set/Train/Letters/   - отдельные буквы
-#   Data-set/Train/Nums/      - цифры
-#   Data-set/Train/Punkt/     - знаки пунктуации
-#   Data-set/Train/Words/     - слова
-#   Data-set/Train/Sentences/ - абзацы и предложения
+Synthetic handwritten text dataset generator with parallel processing support.
+Generates letters, digits, punctuation, words, and sentences with realistic augmentations.
+"""
 
 import os
-import cv2
 import sys
 import time
 import random
 import platform
 import multiprocessing as mp
 from pathlib import Path
+from typing import Optional
+
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from tqdm import tqdm
 
 
-# настройки - менять только здесь 
 class Config:
-    BASE_DIR     = "Data-set/Train"   # корневая папка
+    """Configuration parameters for dataset generation."""
 
-    LETTERS_DIR  = "Data-set/Train/Letters"
-    NUMS_DIR     = "Data-set/Train/Nums"
-    PUNKT_DIR    = "Data-set/Train/Punkt"
-    WORDS_DIR    = "Data-set/Train/Words"
-    SENTENCES_DIR = "Data-set/Train/Sentences"
+    BASE_DIR: str = "Data-set/Train"
 
-    FONTS_DIR    = "fonts"            # папка со шрифтами
-    WORDS_FILE   = "russian_words.txt" # словарь - скачай заранее
+    LETTERS_DIR: str = "Data-set/Train/Letters"
+    NUMS_DIR: str = "Data-set/Train/Nums"
+    PUNKT_DIR: str = "Data-set/Train/Punkt"
+    WORDS_DIR: str = "Data-set/Train/Words"
+    SENTENCES_DIR: str = "Data-set/Train/Sentences"
 
-    LABELS_FILE  = "labels.txt"       # имя файла меток в каждой папке
+    FONTS_DIR: str = "fonts"
+    WORDS_FILE: str = "russian_words.txt"
+    LABELS_FILE: str = "labels.txt"
 
-    # сколько генерировать
-    LETTERS_PER_CHAR  = 50
-    NUMS_PER_CHAR     = 50
-    PUNKT_PER_CHAR    = 50
-    WORDS_COUNT       = 1000
-    SENTENCES_COUNT   = 500
+    LETTERS_PER_CHAR: int = 50
+    NUMS_PER_CHAR: int = 50
+    PUNKT_PER_CHAR: int = 50
+    WORDS_COUNT: int = 1000
+    SENTENCES_COUNT: int = 500
 
-    # размеры изображений
-    CHAR_H       = 64     # высота для букв цифр пунктуации
-    CHAR_W       = 64     # ширина
-    WORD_H       = 64     # высота для слов
-    SENTENCE_H   = 128    # высота для предложений (больше текста)
-    SENTENCE_W   = 1024   # ширина для предложений
+    CHAR_H: int = 64
+    CHAR_W: int = 64
+    WORD_H: int = 64
+    SENTENCE_H: int = 128
+    SENTENCE_W: int = 1024
 
-    # параллельность
-    if platform.system() == "Darwin":  # macOS M1 оптимизация
-        NUM_WORKERS  = mp.cpu_count() * 2  # 16 процессов для 8 ядер
+    if platform.system() == "Darwin":
+        NUM_WORKERS: int = mp.cpu_count() * 2
     else:
-        NUM_WORKERS  = mp.cpu_count() or 4
-    LABEL_FLUSH  = 500    # буфер записи меток
+        NUM_WORKERS: int = mp.cpu_count() or 4
 
-    # символы которые генерируем
-    RUS_LOWER  = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-    RUS_UPPER  = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-    DIGITS     = "0123456789"
-    PUNKT      = ".,!?:;-—()[]«»\"'"
+    LABEL_FLUSH: int = 500
 
-    # черный список шрифтов
-    FONT_BLACKLIST = {
+    RUS_LOWER: str = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+    RUS_UPPER: str = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+    DIGITS: str = "0123456789"
+    PUNKT: str = ".,!?:;-—()[]«»\"'"
+
+    FONT_BLACKLIST: set[str] = {
         "Freestyle_Script_Bold__RUS",
         "KosolapaScript_Regular",
         "letov",
     }
 
-    # минимальные параметры предложений
-    MIN_WORDS_IN_SENTENCE = 5
-    MAX_WORDS_IN_SENTENCE = 20
-    MIN_SENTENCES_IN_PARA = 2
-    MAX_SENTENCES_IN_PARA = 5
+    MIN_WORDS_IN_SENTENCE: int = 5
+    MAX_WORDS_IN_SENTENCE: int = 20
+    MIN_SENTENCES_IN_PARA: int = 2
+    MAX_SENTENCES_IN_PARA: int = 5
 
 
 C = Config()
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
 
-# безопасные имена для файлов пунктуации
-SAFE_NAMES = {
+SAFE_NAMES: dict[str, str] = {
     ".": "point", ",": "comma", "!": "excl", "?": "quest",
     ":": "colon", ";": "semicol", "-": "dash", "—": "emdash",
     "(": "paren_o", ")": "paren_c", "[": "brack_o", "]": "brack_c",
@@ -92,34 +84,32 @@ SAFE_NAMES = {
 }
 
 
-# сканирование шрифтов
-def scan_fonts() -> list:
+def scan_fonts() -> list[str]:
+    """Scan for available font files in configured directories."""
     FONT_EXTS = {".ttf", ".otf", ".ttc"}
     os.makedirs(C.FONTS_DIR, exist_ok=True)
-    fonts = []
+    fonts: list[str] = []
 
     for fn in sorted(os.listdir(C.FONTS_DIR)):
         if Path(fn).suffix.lower() not in FONT_EXTS:
             continue
         stem = Path(fn).stem
         if stem in C.FONT_BLACKLIST:
-            print(f"  skip  {fn}")
             continue
         path = os.path.join(C.FONTS_DIR, fn)
         if os.path.getsize(path) > 1000:
             fonts.append(path)
 
     if not fonts:
-        sdirs = []
+        search_dirs: list[str] = []
         if platform.system() == "Windows":
-            sdirs = [r"C:\Windows\Fonts"]
+            search_dirs = [r"C:\Windows\Fonts"]
         elif platform.system() == "Darwin":
-            sdirs = ["/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
+            search_dirs = ["/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
         else:
-            sdirs = ["/usr/share/fonts", os.path.expanduser("~/.fonts")]
+            search_dirs = ["/usr/share/fonts", os.path.expanduser("~/.fonts")]
 
-        print("  шрифтов в fonts/ нет - ищем системные...")
-        for sd in sdirs:
+        for sd in search_dirs:
             if not os.path.isdir(sd):
                 continue
             for root, _, files in os.walk(sd):
@@ -129,40 +119,42 @@ def scan_fonts() -> list:
                             fonts.append(os.path.join(root, fn))
 
     if not fonts:
-        print("  ошибка: нет шрифтов - положи .ttf в папку fonts/")
+        print("Error: No fonts found. Please place .ttf files in the fonts/ directory.")
         sys.exit(1)
 
-    print(f"  шрифтов: {len(fonts)}")
     return fonts
 
 
-# загрузка словаря
-def load_words() -> list:
+def load_words() -> list[str]:
+    """Load Russian words from dictionary file."""
     if not Path(C.WORDS_FILE).exists():
-        print(f"  файл не найден: {C.WORDS_FILE}")
-        print("  скачай: https://raw.githubusercontent.com/danakt/russian-words/master/russian.txt")
+        print(f"Warning: Dictionary file not found: {C.WORDS_FILE}")
         return []
 
     for enc in ("utf-8", "utf-8-sig", "cp1251"):
         try:
             with open(C.WORDS_FILE, "r", encoding=enc) as f:
                 words = [ln.strip() for ln in f if ln.strip()]
-            print(f"  словарь: {len(words):,} слов ({enc})")
             return words
         except UnicodeDecodeError:
             continue
     return []
 
 
-# рендер текста - возвращает numpy array (оптимизировано для M1)
-def render_text(text: str, font_path: str, img_h: int, img_w: int = None) -> np.ndarray:
+def render_text(
+    text: str,
+    font_path: str,
+    img_h: int,
+    img_w: Optional[int] = None
+) -> Optional[np.ndarray]:
+    """Render text to image using specified font and dimensions."""
     try:
         font = None
         for fs in range(52, 10, -2):
-            f    = ImageFont.truetype(font_path, fs)
+            f = ImageFont.truetype(font_path, fs)
             bbox = f.getbbox(text)
-            h    = bbox[3] - bbox[1]
-            w    = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            w = bbox[2] - bbox[0]
             fits_h = h <= img_h * 0.85
             fits_w = (img_w is None) or (w <= img_w * 0.95)
             if fits_h and fits_w:
@@ -172,26 +164,24 @@ def render_text(text: str, font_path: str, img_h: int, img_w: int = None) -> np.
             font = ImageFont.truetype(font_path, 10)
 
         bbox = font.getbbox(text)
-        tw   = bbox[2] - bbox[0]
-        th   = bbox[3] - bbox[1]
-        pad  = 20
-        cw   = img_w if img_w else max(tw + pad * 2, 60)
-        ch   = img_h + 16
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        pad = 20
+        cw = img_w if img_w else max(tw + pad * 2, 60)
+        ch = img_h + 16
 
-        # Используем RGBA для лучшей производительности на M1
-        img  = Image.new("RGBA", (cw, ch), (255, 255, 255, 255))
+        img = Image.new("RGBA", (cw, ch), (255, 255, 255, 255))
         draw = ImageDraw.Draw(img)
 
         x = (cw - tw) // 2 - bbox[0] + random.randint(-3, 3)
         y = (ch - th) // 2 - bbox[1] + random.randint(-3, 3)
         draw.text((x, y), text, font=font, fill=(random.randint(10, 60), 0, 0, 255))
 
-        # Конвертируем в grayscale быстрее
         img = img.convert("L")
-        img   = ImageOps.crop(img, (0, 4, 0, 4))
+        img = ImageOps.crop(img, (0, 4, 0, 4))
         scale = img_h / img.height
-        nw    = img_w if img_w else max(int(img.width * scale), 16)
-        img   = img.resize((nw, img_h), Image.Resampling.LANCZOS)
+        nw = img_w if img_w else max(int(img.width * scale), 16)
+        img = img.resize((nw, img_h), Image.Resampling.LANCZOS)
 
         return np.array(img, dtype=np.uint8)
 
@@ -199,84 +189,93 @@ def render_text(text: str, font_path: str, img_h: int, img_w: int = None) -> np.
         return None
 
 
-# фон
 def make_background(w: int, h: int) -> np.ndarray:
+    """Generate randomized background texture."""
     bg_type = random.choices(
         ["white", "cream", "lined", "grid", "aged"],
         weights=[30, 25, 20, 15, 10]
     )[0]
 
     if bg_type == "white":
-        bg = np.full((h, w), 255, np.uint8)
+        return np.full((h, w), 255, np.uint8)
+
     elif bg_type == "cream":
-        base  = random.randint(232, 250)
-        bg    = np.full((h, w), base, np.uint8)
+        base = random.randint(232, 250)
+        bg = np.full((h, w), base, np.uint8)
         noise = np.random.randint(-6, 6, (h, w), dtype=np.int16)
-        bg    = np.clip(bg.astype(np.int16) + noise, 200, 255).astype(np.uint8)
+        return np.clip(bg.astype(np.int16) + noise, 200, 255).astype(np.uint8)
+
     elif bg_type == "lined":
-        bg   = np.full((h, w), 255, np.uint8)
+        bg = np.full((h, w), 255, np.uint8)
         step = random.choice([8, 10, 12, 16])
         for y in range(0, h, step):
             bg[y, :] = random.randint(185, 215)
+        return bg
+
     elif bg_type == "grid":
-        bg   = np.full((h, w), 255, np.uint8)
+        bg = np.full((h, w), 255, np.uint8)
         step = random.choice([8, 10, 12])
         for y in range(0, h, step):
             bg[y, :] = random.randint(190, 215)
         for x in range(0, w, step):
             bg[:, x] = random.randint(190, 215)
+        return bg
+
     else:  # aged
-        base  = random.randint(210, 238)
-        bg    = np.full((h, w), base, np.uint8)
+        base = random.randint(210, 238)
+        bg = np.full((h, w), base, np.uint8)
         noise = np.random.randint(-18, 18, (h, w), dtype=np.int16)
-        bg    = np.clip(bg.astype(np.int16) + noise, 180, 255).astype(np.uint8)
+        bg = np.clip(bg.astype(np.int16) + noise, 180, 255).astype(np.uint8)
         for _ in range(random.randint(0, 4)):
             cx = random.randint(0, w - 1)
             cy = random.randint(0, h - 1)
             cv2.circle(bg, (cx, cy), random.randint(3, 15), random.randint(175, 210), -1)
+        return bg
 
-    return bg
 
-
-# аугментации
 def augment(img: np.ndarray) -> np.ndarray:
+    """Apply random augmentations to simulate handwritten variations."""
     r = random.random
 
     if r() > 0.35:
-        k   = random.choice([3, 5])
+        k = random.choice([3, 5])
         img = cv2.GaussianBlur(img, (k, k), random.uniform(0.3, 1.2))
 
     if r() > 0.25:
         noise = np.random.normal(0, random.uniform(4, 14), img.shape)
-        img   = np.clip(img.astype(np.int16) + noise.astype(np.int16), 0, 255).astype(np.uint8)
+        img = np.clip(img.astype(np.int16) + noise.astype(np.int16), 0, 255).astype(np.uint8)
 
     if r() > 0.5:
-        img = cv2.convertScaleAbs(img,
-                                  alpha=random.uniform(0.82, 1.18),
-                                  beta=random.randint(-12, 12))
+        img = cv2.convertScaleAbs(
+            img,
+            alpha=random.uniform(0.82, 1.18),
+            beta=random.randint(-12, 12)
+        )
 
     if r() > 0.55:
         h, w = img.shape
-        sf   = random.uniform(-0.06, 0.06)
-        M    = np.float32([[1, sf, 0], [0, 1, 0]])
-        img  = cv2.warpAffine(img, M, (w, h),
-                              borderMode=cv2.BORDER_REPLICATE,
-                              flags=cv2.INTER_LINEAR)
+        sf = random.uniform(-0.06, 0.06)
+        M = np.float32([[1, sf, 0], [0, 1, 0]])
+        img = cv2.warpAffine(
+            img, M, (w, h),
+            borderMode=cv2.BORDER_REPLICATE,
+            flags=cv2.INTER_LINEAR
+        )
 
     if r() > 0.72:
-        h, w    = img.shape
-        freq    = random.uniform(18, 55)
-        amp     = random.uniform(1.0, 2.5)
-        phase   = random.uniform(0, 6.28)
+        h, w = img.shape
+        freq = random.uniform(18, 55)
+        amp = random.uniform(1.0, 2.5)
+        phase = random.uniform(0, 6.28)
         offsets = (amp * np.sin(np.arange(w, dtype=np.float32) / freq + phase)).astype(int)
-        map_x   = np.tile(np.arange(w), (h, 1)).astype(np.float32)
-        map_y   = (np.tile(np.arange(h), (w, 1)).T + offsets).astype(np.float32)
-        img     = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, cv2.BORDER_REPLICATE)
+        map_x = np.tile(np.arange(w), (h, 1)).astype(np.float32)
+        map_y = (np.tile(np.arange(h), (w, 1)).T + offsets).astype(np.float32)
+        img = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, cv2.BORDER_REPLICATE)
 
     if r() > 0.82:
-        h, w  = img.shape
+        h, w = img.shape
         seg_w = max(w // random.randint(3, 7), 1)
-        res   = img.copy()
+        res = img.copy()
         for i in range(0, w, seg_w):
             off = random.randint(-1, 1)
             res[:, i:i + seg_w] = np.roll(img[:, i:i + seg_w], off, axis=0)
@@ -285,10 +284,12 @@ def augment(img: np.ndarray) -> np.ndarray:
     if r() > 0.88:
         h, w = img.shape
         for _ in range(random.randint(1, 3)):
-            cv2.circle(img,
-                       (random.randint(0, w-1), random.randint(0, h-1)),
-                       random.randint(1, 3),
-                       int(random.uniform(175, 220)), -1)
+            cv2.circle(
+                img,
+                (random.randint(0, w - 1), random.randint(0, h - 1)),
+                random.randint(1, 3),
+                int(random.uniform(175, 220)), -1
+            )
 
     if r() > 0.92:
         _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -296,55 +297,55 @@ def augment(img: np.ndarray) -> np.ndarray:
     return img
 
 
-# пайплайн одного изображения
-def generate_one(text: str, font_path: str, img_h: int, img_w: int = None) -> np.ndarray:
+def generate_one(
+    text: str,
+    font_path: str,
+    img_h: int,
+    img_w: Optional[int] = None
+) -> Optional[np.ndarray]:
+    """Generate a single augmented image from text."""
     arr = render_text(text, font_path, img_h, img_w)
     if arr is None:
         return None
     arr = augment(arr)
-    bg  = make_background(arr.shape[1], arr.shape[0])
-    mask    = arr < 200
-    out     = bg.copy()
+    bg = make_background(arr.shape[1], arr.shape[0])
+    mask = arr < 200
+    out = bg.copy()
     out[mask] = arr[mask]
     if random.random() > 0.6:
         out = cv2.GaussianBlur(out, (3, 3), 0)
     return out
 
 
-# сохранение с поддержкой кириллических путей (оптимизировано для M1)
-def save_image(path: str, img: np.ndarray):
-    # Используем более быстрый метод для M1
-    cv2.imwrite(path, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])  # без сжатия для скорости
+def save_image(path: str, img: np.ndarray) -> None:
+    """Save image to disk with minimal compression for speed."""
+    cv2.imwrite(path, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
 
 
-# генерация предложений из слов
-def build_sentence(words: list) -> str:
-    n      = random.randint(C.MIN_WORDS_IN_SENTENCE, C.MAX_WORDS_IN_SENTENCE)
+def build_sentence(words: list[str]) -> str:
+    """Build a random sentence from word list."""
+    n = random.randint(C.MIN_WORDS_IN_SENTENCE, C.MAX_WORDS_IN_SENTENCE)
     chosen = random.choices(words, k=n)
-
-    # капитализируем первое слово
     chosen[0] = chosen[0].capitalize()
-
     sentence = " ".join(chosen)
-
-    # добавляем знак в конце
     end = random.choice([".", ".", ".", "!", "?"])
     sentence += end
-
     return sentence
 
 
-def build_paragraph(words: list) -> str:
+def build_paragraph(words: list[str]) -> str:
+    """Build a random paragraph with multiple sentences."""
     n_sentences = random.randint(C.MIN_SENTENCES_IN_PARA, C.MAX_SENTENCES_IN_PARA)
-    sentences   = [build_sentence(words) for _ in range(n_sentences)]
+    sentences = [build_sentence(words) for _ in range(n_sentences)]
     return " ".join(sentences)
 
 
-# воркер
-_fonts_global = []
-_words_global = []
+_fonts_global: list[str] = []
+_words_global: list[str] = []
 
-def _worker_init(fonts, words):
+
+def _worker_init(fonts: list[str], words: list[str]) -> None:
+    """Initialize worker process with shared resources."""
     global _fonts_global, _words_global
     _fonts_global = fonts
     _words_global = words
@@ -352,11 +353,11 @@ def _worker_init(fonts, words):
     np.random.seed(os.getpid() % (2 ** 31))
 
 
-def _worker_fn(task):
-    # task = (idx, text, out_dir, img_h, img_w, fname_prefix)
+def _worker_fn(task: tuple) -> Optional[tuple[str, str]]:
+    """Process a single generation task."""
     idx, text, out_dir, img_h, img_w, fname_prefix = task
     font_path = random.choice(_fonts_global)
-    img       = generate_one(text, font_path, img_h, img_w)
+    img = generate_one(text, font_path, img_h, img_w)
     if img is None:
         return None
     fname = f"{fname_prefix}_{idx:07d}.png"
@@ -366,46 +367,51 @@ def _worker_fn(task):
     return fname, text
 
 
-# основная функция генерации группы
-def generate_group(tasks_list: list, out_dir: str, group_name: str, fonts: list, words: list):
+def generate_group(
+    tasks_list: list,
+    out_dir: str,
+    group_name: str,
+    fonts: list[str],
+    words: list[str]
+) -> None:
+    """Generate a group of images using parallel processing."""
     os.makedirs(out_dir, exist_ok=True)
     labels_path = os.path.join(out_dir, C.LABELS_FILE)
 
-    # проверяем уже сгенерированное
     done = 0
     if os.path.exists(labels_path):
         with open(labels_path, "r", encoding="utf-8") as f:
             done = sum(1 for _ in f)
         if done > 0:
-            print(f"  уже есть {done} - продолжаем с {done}")
+            print(f"  Found {done} existing samples - resuming from {done}")
 
     tasks = tasks_list[done:]
     if not tasks:
-        print(f"  [{group_name}] всё уже сгенерировано")
+        print(f"  [{group_name}] All samples already generated")
         return
 
     n_workers = C.NUM_WORKERS or max(1, mp.cpu_count())
-    success   = 0
-    errors    = 0
-    label_buf = []
-    t_start   = time.perf_counter()
+    success = 0
+    errors = 0
+    label_buf: list[str] = []
+    t_start = time.perf_counter()
 
     labels_file = open(labels_path, "a", encoding="utf-8", buffering=1)
 
-    ctx  = mp.get_context("spawn")  # spawn лучше для macOS
+    ctx = mp.get_context("spawn")
     pool = ctx.Pool(
-        processes        = n_workers,
-        initializer      = _worker_init,
-        initargs         = (fonts, words),
-        maxtasksperchild = 5000,  # больше задач на процесс для M1
+        processes=n_workers,
+        initializer=_worker_init,
+        initargs=(fonts, words),
+        maxtasksperchild=5000,
     )
 
     try:
-        with tqdm(total=len(tasks), unit="img", ncols=80,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining} {rate_fmt}]"
-                  ) as pbar:
-            for result in pool.imap_unordered(_worker_fn, tasks,
-                                              chunksize=max(1, n_workers * 4)):
+        with tqdm(
+            total=len(tasks), unit="img", ncols=80,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining} {rate_fmt}]"
+        ) as pbar:
+            for result in pool.imap_unordered(_worker_fn, tasks, chunksize=max(1, n_workers * 4)):
                 if result is None:
                     errors += 1
                     pbar.update(1)
@@ -418,14 +424,14 @@ def generate_group(tasks_list: list, out_dir: str, group_name: str, fonts: list,
                     label_buf.clear()
                 elapsed = time.perf_counter() - t_start
                 pbar.set_postfix({
-                    "ok":    success,
-                    "err":   errors,
+                    "ok": success,
+                    "err": errors,
                     "img/s": f"{success/elapsed:.0f}" if elapsed > 0 else "0",
                 }, refresh=False)
                 pbar.update(1)
 
     except KeyboardInterrupt:
-        print("\n  прервано - прогресс сохранён")
+        print("\n  Interrupted - progress saved")
     finally:
         pool.terminate()
         pool.join()
@@ -434,77 +440,57 @@ def generate_group(tasks_list: list, out_dir: str, group_name: str, fonts: list,
         labels_file.close()
 
     elapsed = time.perf_counter() - t_start
-    print(f"  [{group_name}] {success} изображений за {elapsed/60:.1f} мин ({success/elapsed:.0f} img/s)")
+    print(f"  [{group_name}] Generated {success} images in {elapsed/60:.1f} min ({success/elapsed:.0f} img/s)")
     if errors:
-        print(f"  ошибок: {errors}")
+        print(f"  Errors: {errors}")
 
 
-def main():
-    print()
-    print("+============================================================+")
-    print("|        g-vision - генератор всего датасета                |")
-    print("+============================================================+")
-    print()
+def main() -> None:
+    """Main entry point for dataset generation."""
+    print("\nG-VISION OCR — Dataset Generator\n")
 
-    # создаем все папки
     for d in [C.LETTERS_DIR, C.NUMS_DIR, C.PUNKT_DIR, C.WORDS_DIR, C.SENTENCES_DIR]:
         os.makedirs(d, exist_ok=True)
-        print(f"  папка: {d}")
+        print(f"  Directory: {d}")
     print()
 
-    # сканируем шрифты
-    print("шрифты:")
+    print("Scanning fonts:")
     fonts = scan_fonts()
-    print()
+    print(f"  Found {len(fonts)} fonts\n")
 
-    # загружаем словарь
-    print("словарь:")
+    print("Loading dictionary:")
     words = load_words()
     if not words:
-        words = ["привет", "мир", "слово", "текст", "буква"]  # минимальный fallback
-    print()
+        words = ["hello", "world", "text", "sample", "word"]
+        print(f"  Using fallback dictionary: {len(words)} words")
+    else:
+        print(f"  Loaded {len(words):,} words\n")
 
-    all_chars   = C.RUS_LOWER + C.RUS_UPPER  # все буквы
+    all_chars = C.RUS_LOWER + C.RUS_UPPER
 
-    # ------------------------------------------------------------------
-    # буквы
-    # ------------------------------------------------------------------
-    print("+--- Letters " + "-" * 48 + "+")
-    print(f"  символов: {len(all_chars)}  |  на каждый: {C.LETTERS_PER_CHAR}")
-
+    # Letters
+    print(f"Generating letters: {len(all_chars)} chars × {C.LETTERS_PER_CHAR} samples")
     letter_tasks = []
     for idx, char in enumerate(all_chars * C.LETTERS_PER_CHAR):
-        # перемешиваем чтобы не было все а потом все б
         letter_tasks.append((idx, char, C.LETTERS_DIR, C.CHAR_H, C.CHAR_W, "letter"))
     random.shuffle(letter_tasks)
-    # переиндексируем после перемешивания
     letter_tasks = [(i,) + t[1:] for i, t in enumerate(letter_tasks)]
-
     generate_group(letter_tasks, C.LETTERS_DIR, "letters", fonts, words)
     print()
 
-    # ------------------------------------------------------------------
-    # цифры
-    # ------------------------------------------------------------------
-    print("+--- Nums " + "-" * 51 + "+")
-    print(f"  символов: {len(C.DIGITS)}  |  на каждый: {C.NUMS_PER_CHAR}")
-
+    # Digits
+    print(f"Generating digits: {len(C.DIGITS)} chars × {C.NUMS_PER_CHAR} samples")
     num_tasks = []
     for char in C.DIGITS:
         for i in range(C.NUMS_PER_CHAR):
             num_tasks.append((0, char, C.NUMS_DIR, C.CHAR_H, C.CHAR_W, f"num_{char}"))
     random.shuffle(num_tasks)
     num_tasks = [(i,) + t[1:] for i, t in enumerate(num_tasks)]
-
     generate_group(num_tasks, C.NUMS_DIR, "nums", fonts, words)
     print()
 
-    # ------------------------------------------------------------------
-    # пунктуация
-    # ------------------------------------------------------------------
-    print("+--- Punkt " + "-" * 50 + "+")
-    print(f"  символов: {len(C.PUNKT)}  |  на каждый: {C.PUNKT_PER_CHAR}")
-
+    # Punctuation
+    print(f"Generating punctuation: {len(C.PUNKT)} chars × {C.PUNKT_PER_CHAR} samples")
     punkt_tasks = []
     for char in C.PUNKT:
         sname = SAFE_NAMES.get(char, f"U{ord(char):04X}")
@@ -512,73 +498,51 @@ def main():
             punkt_tasks.append((0, char, C.PUNKT_DIR, C.CHAR_H, C.CHAR_W, sname))
     random.shuffle(punkt_tasks)
     punkt_tasks = [(i,) + t[1:] for i, t in enumerate(punkt_tasks)]
-
     generate_group(punkt_tasks, C.PUNKT_DIR, "punkt", fonts, words)
     print()
 
-    # ------------------------------------------------------------------
-    # слова
-    # ------------------------------------------------------------------
-    print("+--- Words " + "-" * 50 + "+")
-    print(f"  слов: {C.WORDS_COUNT}")
-
-    word_pool  = [w for w in words if 2 <= len(w) <= 20]
+    # Words
+    print(f"Generating words: {C.WORDS_COUNT} samples")
+    word_pool = [w for w in words if 2 <= len(w) <= 20]
     word_tasks = []
     for i in range(C.WORDS_COUNT):
         word = random.choice(word_pool)
         word_tasks.append((i, word, C.WORDS_DIR, C.WORD_H, None, "word"))
-
     generate_group(word_tasks, C.WORDS_DIR, "words", fonts, words)
     print()
 
-    # ------------------------------------------------------------------
-    # предложения и абзацы
-    # ------------------------------------------------------------------
-    print("+--- Sentences " + "-" * 46 + "+")
-    print(f"  предложений/абзацев: {C.SENTENCES_COUNT}")
-    print(f"  размер изображения: {C.SENTENCE_W}x{C.SENTENCE_H}px")
-
+    # Sentences
+    print(f"Generating sentences/paragraphs: {C.SENTENCES_COUNT} samples")
+    print(f"  Image size: {C.SENTENCE_W}×{C.SENTENCE_H}px")
     sentence_tasks = []
     for i in range(C.SENTENCES_COUNT):
-        # половина - предложения половина - абзацы
         if i % 2 == 0:
             text = build_sentence(word_pool)
         else:
             text = build_paragraph(word_pool)
         sentence_tasks.append((i, text, C.SENTENCES_DIR, C.SENTENCE_H, C.SENTENCE_W, "sent"))
-
     generate_group(sentence_tasks, C.SENTENCES_DIR, "sentences", fonts, words)
     print()
 
-    # итог
-    print("+============================================================+")
-    print("|  готово!                                                   |")
-    print("+------------------------------------------------------------+")
+    # Summary
+    print("Generation complete.")
     for folder, name in [
-        (C.LETTERS_DIR,   "letters  "),
-        (C.NUMS_DIR,      "nums     "),
-        (C.PUNKT_DIR,     "punkt    "),
-        (C.WORDS_DIR,     "words    "),
+        (C.LETTERS_DIR, "letters"),
+        (C.NUMS_DIR, "nums"),
+        (C.PUNKT_DIR, "punkt"),
+        (C.WORDS_DIR, "words"),
         (C.SENTENCES_DIR, "sentences"),
     ]:
         n = sum(1 for _ in Path(folder).glob("*.png"))
-        print(f"|  {name}: {n:>8} изображений  ({folder})")
-    print("+============================================================+")
+        print(f"  {name}: {n} images ({folder})")
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("ОПТИМИЗАЦИИ ДЛЯ MACBOOK AIR M1:")
-    print("• 16 параллельных процессов (8 ядер × 2)")
-    print("• Spawn context для стабильности на macOS")
-    print("• Быстрое сохранение PNG без сжатия")
-    print("• Оптимизированный рендер текста")
-    print("• 5000 задач на процесс для эффективности")
-    print("=" * 60)
-    for pkg in ("cv2", "PIL", "numpy", "tqdm"):
+    required = ("cv2", "PIL", "numpy", "tqdm")
+    for pkg in required:
         try:
             __import__(pkg)
         except ImportError:
-            print(f"  установи: pip install opencv-python pillow numpy tqdm")
+            print(f"Missing dependency: pip install opencv-python pillow numpy tqdm")
             sys.exit(1)
     main()
