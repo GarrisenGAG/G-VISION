@@ -1,4 +1,3 @@
-# G-Vision OCR Application Requirements
 # Python 3.10+
 
 # Deep Learning
