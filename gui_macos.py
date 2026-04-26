@@ -10,7 +10,7 @@ import os
 import cv2
 import numpy as np
 
-# Константы
+# Constants
 __version__ = "1.0.0"
 APP_NAME = "G-Vision OCR"
 WINDOW_WIDTH = 900
@@ -20,7 +20,7 @@ MIN_HEIGHT = 500
 IMAGE_PREVIEW_WIDTH = 600
 IMAGE_PREVIEW_HEIGHT = 400
 
-# Настройка логирования
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -32,7 +32,7 @@ ctk.set_default_color_theme("blue")
 
 
 class AnimationIndicator:
-    """Маленький анимированный индикатор загрузки с прозрачностью"""
+    """Small animated loading indicator with transparency"""
     def __init__(self, video_path, size=48):
         self.video_path = video_path
         self.size = size
@@ -41,7 +41,7 @@ class AnimationIndicator:
         self._load_frames()
     
     def _load_frames(self):
-        """Загрузка и масштабирование кадров"""
+        """Load and scale frames"""
         try:
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -53,21 +53,21 @@ class AnimationIndicator:
                 if not ret:
                     break
                 
-                # Преобразование BGR в RGB
+                # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Масштабирование до нужного размера
+                # Resize to requested size
                 frame_resized = cv2.resize(frame, (self.size, self.size))
                 
-                # Преобразование в PIL Image
+                # Convert to PIL Image
                 pil_image = Image.fromarray(frame_resized).convert("RGBA")
 
-                # Преобразуем черный фон в прозрачный и задаем общую непрозрачность
+                # Convert black background to transparent and set alpha
                 arr = np.array(pil_image)
-                # Черный цвет (либо очень темный) становится полностью прозрачным
+                # Black color (or very dark) becomes fully transparent
                 black_mask = (arr[:, :, 0] < 30) & (arr[:, :, 1] < 30) & (arr[:, :, 2] < 30)
                 arr[black_mask, 3] = 0
-                # Все остальное — на уровне 78% (200)
+                # Set remaining pixels to 78% opacity (200)
                 arr[~black_mask, 3] = 200
                 pil_image = Image.fromarray(arr, mode='RGBA')
 
@@ -79,20 +79,20 @@ class AnimationIndicator:
             logger.error(f"Error loading frames: {e}")
     
     def get_frame(self, index):
-        """Получить кадр по индексу"""
+        """Get frame by index"""
         if len(self.frames) == 0:
             return None
         
-        # Циклическое проигрывание
+        # Loop playback
         index = index % len(self.frames)
         return self.frames[index]
     
     def get_frames_count(self):
-        """Получить количество кадров"""
+        """Get frames count"""
         return len(self.frames)
     
     def reset_index(self):
-        """Сбросить индекс"""
+        """Reset index"""
         self.current_frame_index = 0
 
 
@@ -104,7 +104,7 @@ class App(ctk.CTk):
             self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
             self.minsize(MIN_WIDTH, MIN_HEIGHT)
 
-            # Центрирование окна на экране
+            # Center window on screen
             screen_w = self.winfo_screenwidth()
             screen_h = self.winfo_screenheight()
             x = (screen_w - WINDOW_WIDTH) // 2
@@ -113,7 +113,7 @@ class App(ctk.CTk):
 
             self.configure(fg_color="#010101")
 
-            # Инициализация анимации для индикатора
+            # Initialize animation indicator
             self.animation_indicator = None
             self.animation_index = 0
             self.is_showing_animation = False
@@ -138,7 +138,7 @@ class App(ctk.CTk):
             )
             self.content_area.pack(side="right", fill="both", expand=True)
 
-            # Инициализация состояния
+            # Initialize state
             self.image_path = None
             self.is_processing = False
             self.current_image = None
@@ -148,10 +148,10 @@ class App(ctk.CTk):
             self._build_content()
             self._setup_shortcuts()
 
-            # Попытка подгрузить OCR-модель
+            # Attempt to load OCR model
             self._init_ocr()
 
-            # Начальный эффект плавного появления окна
+            # Initial fade-in effect for the window
             self.attributes("-alpha", 0.0)
             self._fade_window_to(target_alpha=1.0, duration=300, steps=20)
 
@@ -161,7 +161,7 @@ class App(ctk.CTk):
             raise
 
     def _fade_in_window(self, steps=20, interval=15):
-        """Плавное появление окна при запуске"""
+        """Fade in window on launch"""
         def step(i):
             value = min(1.0, i / steps)
             self.attributes("-alpha", value)
@@ -170,7 +170,7 @@ class App(ctk.CTk):
         step(0)
 
     def _animate_frame_height(self, target_height, duration=220, steps=10):
-        """Плавное изменение высоты image_frame"""
+        """Animate frame height"""
         start_height = max(1, self.image_frame.winfo_height() or 280)
         delta = target_height - start_height
         if delta == 0:
@@ -185,7 +185,7 @@ class App(ctk.CTk):
         step(1)
 
     def _pulse_image_frame(self, count=4, interval=80):
-        """Пульсирующее подсвечивание рамки image_frame"""
+        """Pulse the image frame"""
         colors = ["#0a1020", "#1d426c", "#0a1020"]
 
         def step(i):
@@ -198,7 +198,7 @@ class App(ctk.CTk):
         step(0)
 
     def _fade_window_to(self, target_alpha=1.0, duration=240, steps=10):
-        """Плавное изменение прозрачности окна"""
+        """Animate window opacity"""
         try:
             start_alpha = float(self.attributes("-alpha") or 1.0)
         except Exception:
@@ -213,9 +213,9 @@ class App(ctk.CTk):
         step(1)
 
     def _init_animation_indicator(self):
-        """Инициализация маленького анимированного индикатора"""
+        """Initialize animation indicator"""
         try:
-            video_path = os.path.join(os.path.dirname(__file__), "0001-0048.mkv")
+            video_path = os.path.join(os.path.dirname(__file__), "wait_anim.mkv")
             if os.path.exists(video_path):
                 self.animation_indicator = AnimationIndicator(video_path, size=32)
                 logger.info(f"Animation indicator initialized with {self.animation_indicator.get_frames_count()} frames")
@@ -225,57 +225,58 @@ class App(ctk.CTk):
             logger.error(f"Error initializing animation indicator: {e}")
 
     def _init_ocr(self):
-        """Подключение предварительно обученной модели OCR best.pt"""
+        """Initialize OCR model from best.pt or g-vision-config.json."""
         try:
-            model_path = os.path.join(os.path.dirname(__file__), "best.pt")
-            config_path = os.path.join(os.path.dirname(__file__), "g-vision-config.json")
+            root_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(root_dir, "best.pt")
+            config_path = os.path.join(root_dir, "g-vision-config.json")
+            config_model_path = None
+
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    model_from_cfg = cfg.get("model")
+                    if model_from_cfg:
+                        candidate = model_from_cfg if os.path.isabs(model_from_cfg) else os.path.join(root_dir, model_from_cfg)
+                        if os.path.exists(candidate):
+                            config_model_path = candidate
+                except Exception as ex:
+                    logger.warning(f"Failed to load OCR config: {ex}")
+
+            if config_model_path and os.path.exists(config_model_path):
+                model_path = config_model_path
 
             if not os.path.exists(model_path):
-                self._set_status("Модель best.pt не найдена", "#e74c3c")
+                fallback_paths = [
+                    os.path.join(root_dir, "best_model.pt"),
+                    os.path.join(root_dir, "G-Vision.pt"),
+                    os.path.join(root_dir, "G-VISION.pt"),
+                    os.path.join(root_dir, "best.pt"),
+                    os.path.join(root_dir, "runs", "ocr_final", "best_model.pt")
+                ]
+                for p in fallback_paths:
+                    if os.path.exists(p):
+                        model_path = p
+                        break
+
+            if not os.path.exists(model_path):
+                self._set_status("OCR model not found", "#e74c3c")
                 logger.warning(f"OCR model not found: {model_path}")
                 return
 
-            # Если конфиг отсутствует, пробуем сгенерировать из class_mapping (train.py)
-            if not os.path.exists(config_path):
-                fallback_mapping = os.path.join(os.path.dirname(__file__), "Data-set/YOLO/class_mapping.json")
-                if os.path.exists(fallback_mapping):
-                    try:
-                        with open(fallback_mapping, encoding="utf-8") as f:
-                            mapping_json = json.load(f)
-                        config_data = {
-                            "model": model_path,
-                            "base_model": "yolov8l.pt",
-                            "image_size": 64,
-                            "use_tta": True,
-                            "char_to_id": mapping_json.get("char_to_id", {}),
-                            "id_to_char": mapping_json.get("id_to_char", {}),
-                            "dict_file": "russian_words.txt",
-                            "fuzzy_thresh": 0.78,
-                            "num_classes": len(mapping_json.get("char_to_id", {})),
-                        }
-                        with open(config_path, "w", encoding="utf-8") as f:
-                            json.dump(config_data, f, ensure_ascii=False, indent=2)
-                        logger.info(f"Created fallback config: {config_path}")
-                        self._set_status("Создан fallback config для OCR", "#f1c40f")
-                    except Exception as ex:
-                        logger.warning(f"Не удалось создать fallback config: {ex}")
-
-            if not os.path.exists(config_path):
-                self._set_status("Конфиг g-vision-config.json не найден", "#e74c3c")
-                logger.warning(f"OCR config not found: {config_path}")
-                return
-
+            config_arg = config_path if os.path.exists(config_path) else None
             from train import GVisionOCR
-            self.ocr = GVisionOCR(model_path, config_path)
-            self._set_status("Модель best.pt подключена", "#2ecc71")
-            logger.info(f"OCR model initialized from {model_path}, config {config_path}")
+            self.ocr = GVisionOCR(model_path, config_arg)
+            self._set_status("OCR model loaded", "#2ecc71")
+            logger.info(f"OCR model initialized from {model_path}, config {config_arg}")
         except Exception as e:
             logger.error(f"Error initializing OCR model: {e}", exc_info=True)
             self.ocr = None
-            self._set_status("Ошибка при загрузке OCR", "#e74c3c")
+            self._set_status("OCR loading error", "#e74c3c")
 
     def _setup_shortcuts(self):
-        """Настройка горячих клавиш"""
+        """Setup shortcuts"""
         shortcuts = [
             ('<Escape>', lambda e: self.destroy()),
             ('<Control-o>', lambda e: self.load_image()),
@@ -290,7 +291,7 @@ class App(ctk.CTk):
 
     def _build_sidebar(self):
         title = ctk.CTkLabel(
-            self.sidebar, text="Управление",
+            self.sidebar, text="Control",
             font=ctk.CTkFont(family="SF Pro Display", size=18, weight="bold"),
             text_color="#ffffff"
         )
@@ -305,13 +306,13 @@ class App(ctk.CTk):
             "text_color": "#ffffff",
         }
 
-        self.btn_load = ctk.CTkButton(self.sidebar, text="📁 Загрузить фото", command=self.load_image, **btn_style)
+        self.btn_load = ctk.CTkButton(self.sidebar, text="📁 Load photo", command=self.load_image, **btn_style)
         self.btn_load.pack(pady=6, padx=15, fill="x")
 
-        self.btn_run = ctk.CTkButton(self.sidebar, text="🔍 Распознать", command=self.recognize, **btn_style)
+        self.btn_run = ctk.CTkButton(self.sidebar, text="🔍 Recognize", command=self.recognize, **btn_style)
         self.btn_run.pack(pady=6, padx=15, fill="x")
 
-        self.btn_clear = ctk.CTkButton(self.sidebar, text="🗑️ Очистить", command=self.clear, **btn_style)
+        self.btn_clear = ctk.CTkButton(self.sidebar, text="🗑️ Clear", command=self.clear, **btn_style)
         self.btn_clear.pack(pady=6, padx=15, fill="x")
 
         separator = ctk.CTkFrame(self.sidebar, height=1, fg_color="#2a3a6a")
@@ -321,7 +322,7 @@ class App(ctk.CTk):
         self.status_frame.pack(pady=10, padx=15, fill="x")
 
         self.status_label = ctk.CTkLabel(
-            self.status_frame, text="Готов к работе",
+            self.status_frame, text="Ready",
             font=ctk.CTkFont(family="SF Pro Text", size=13, weight="bold"),
             text_color="#6a8a7a"
         )
@@ -341,7 +342,7 @@ class App(ctk.CTk):
         info_frame.pack(pady=10, padx=15, fill="both", expand=True)
 
         info_label = ctk.CTkLabel(
-            info_frame, text="Горячие клавиши:\n\nCtrl/Cmd+O — загрузить\nCtrl/Cmd+R — распознать\nCtrl/Cmd+L — очистить\nEsc — выход",
+            info_frame, text="Keyboard shortcuts:\n\nCtrl/Cmd+O — Load\nCtrl/Cmd+R — Recognize\nCtrl/Cmd+L — Clear\nEsc — Exit",
             font=ctk.CTkFont(family="SF Pro Text", size=11),
             text_color="#5a6a8a",
             justify="left"
@@ -350,7 +351,7 @@ class App(ctk.CTk):
 
     def _build_content(self):
         header = ctk.CTkLabel(
-            self.content_area, text="Распознавание текста",
+            self.content_area, text="Text Recognition",
             font=ctk.CTkFont(family="SF Pro Display", size=20, weight="bold"),
             text_color="#ffffff"
         )
@@ -367,7 +368,7 @@ class App(ctk.CTk):
 
         self.image_label = ctk.CTkLabel(
             self.image_frame,
-            text="Перетащите изображение\nили нажмите «Загрузить фото»",
+            text='Drag image here\nor press "Load photo"',
             font=ctk.CTkFont(family="SF Pro Text", size=14),
             text_color="#4a5a7a"
         )
@@ -375,7 +376,7 @@ class App(ctk.CTk):
         self.current_image = None
 
         result_header = ctk.CTkLabel(
-            self.content_area, text="Результат",
+            self.content_area, text="Result",
             font=ctk.CTkFont(family="SF Pro Display", size=16, weight="bold"),
             text_color="#ffffff"
         )
@@ -394,7 +395,7 @@ class App(ctk.CTk):
         self.result_box.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
     def _set_image_label(self, pil_image=None, text=None):
-        """Пересоздание image_label, чтобы избежать устаревших image-ссылок"""
+        """Recreate image_label to avoid stale image references"""
         if hasattr(self, 'image_label') and self.image_label is not None:
             try:
                 self.image_label.destroy()
@@ -418,13 +419,13 @@ class App(ctk.CTk):
         self.current_image = ctk_img
         self.image_label._current_image = ctk_img
 
-        # Включаем визуальные эффекты для плавности
+        # Enable visual smoothing effects
         if pil_image:
             self._animate_frame_height(max(pil_image.size[1], 280))
 
     
     def _update_animation_indicator(self):
-        """Обновление маленького анимированного индикатора в статусе"""
+        """Update small animated indicator in the status area"""
         if not self.is_showing_animation or not self.animation_indicator:
             return
         
@@ -433,12 +434,12 @@ class App(ctk.CTk):
         
         frame = self.animation_indicator.get_frame(self.animation_index)
         if frame is not None:
-            # Конвертация PIL Image в PhotoImage
+            # Convert PIL Image to PhotoImage
             photo = ImageTk.PhotoImage(frame)
             
-            # Обновление лабели в status_frame рядом со статусом
+            # Update label in status_frame next to status
             if not hasattr(self, 'animation_photo_label'):
-                # Создание лабели если её еще нет
+                # Create label if it does not exist yet
                 self.animation_photo_label = Label(
                     self.status_frame,
                     image=None,
@@ -447,77 +448,77 @@ class App(ctk.CTk):
                 self.animation_photo_label.pack(side="right", padx=10, pady=12)
             
             self.animation_photo_label.config(image=photo)
-            self.animation_photo_label.image = photo  # Сохранение ссылки
+            self.animation_photo_label.image = photo  # Preserve reference
         
         self.animation_index += 1
-        self.after(75, self._update_animation_indicator)  # ~13 FPS для плавной анимации
+        self.after(75, self._update_animation_indicator)  # ~13 FPS for smooth animation
     
     def _start_animation_indicator(self):
-        """Запуск маленького анимированного индикатора"""
+        """Start small animated indicator"""
         if self.animation_indicator and not self.is_showing_animation:
             self.is_showing_animation = True
             self.animation_index = 0
             self._update_animation_indicator()
     
     def _stop_animation_indicator(self):
-        """Остановка маленького анимированного индикатора"""
+        """Stop small animated indicator"""
         self.is_showing_animation = False
         if hasattr(self, 'animation_photo_label'):
             self.animation_photo_label.config(image=None)
             self.animation_photo_label.pack_forget()
 
     def load_image(self):
-        """Загрузка изображения с проверками и обработкой ошибок"""
+        """Load image with validation and error handling"""
         if self.is_processing:
-            self._set_status("Подождите, идет обработка", "#f39c12")
+            self._set_status("Processing, please wait", "#f39c12")
             logger.debug("Load image blocked: processing in progress")
             return
         
         try:
-            path = filedialog.askopenfilename(filetypes=[("Изображения", "*.png *.jpg *.jpeg *.bmp *.webp")])
+            path = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp")])
             if not path:
                 logger.debug("Load image cancelled by user")
                 return
             
-            # Проверка существования файла
+            # Verify file exists
             if not os.path.exists(path):
-                raise FileNotFoundError(f"Файл не найден: {path}")
+                raise FileNotFoundError(f"File not found: {path}")
             
-            # Проверка размера файла (максимум 50MB)
+            # Verify file size (maximum 50MB)
             file_size_mb = os.path.getsize(path) / (1024 * 1024)
             if file_size_mb > 50:
-                raise ValueError(f"Файл слишком большой ({file_size_mb:.1f}MB). Максимум 50MB")
+                raise ValueError(f"File is too large ({file_size_mb:.1f}MB). Maximum 50MB")
             
             self.image_path = path
             
-            # Загрузка и валидация изображения
+            # Load and validate image
             img = Image.open(path)
             img.verify()
-            img = Image.open(path)  # Переоткрытие после verify()
+            img = Image.open(path)  # Reopen after verify()
             
-            # Получение и логирование информации об изображении
+            # Collect and log image metadata
             logger.info(f"Loaded image: {path}, size: {img.size}, format: {img.format}")
             
-            # Правильный расчет размера после thumbnail
+            # Correct size calculation after thumbnail
             img.thumbnail((IMAGE_PREVIEW_WIDTH, IMAGE_PREVIEW_HEIGHT), Image.Resampling.LANCZOS)
             display_size = img.size
 
             self._set_image_label(pil_image=img, text="")
 
-            # Включаем визуальные эффекты
+            # Enable visual effects
             self._animate_frame_height(max(display_size[1], 280))
             self._pulse_image_frame(count=4, interval=80)
             self._fade_window_to(target_alpha=1.0, duration=180, steps=6)
 
-            # Очистка результата при загрузке нового изображения
+            # Clear previous result when loading a new image
             self.result_box.delete("1.0", "end")
             
-            self._set_status("Изображение загружено", "#4a9eff")
+            self._set_status("Image loaded", "#4a9eff")
             logger.info("Image loaded successfully")
             
         except FileNotFoundError as e:
             logger.error(f"File not found: {e}")
-            self._set_status("Файл не найден", "#e74c3c")
+            self._set_status("File not found", "#e74c3c")
             self.image_path = None
             
         except ValueError as e:
@@ -528,23 +529,23 @@ class App(ctk.CTk):
         except Exception as e:
             logger.error(f"Error loading image: {e}", exc_info=True)
             error_msg = str(e)[:50]
-            self._set_status(f"Ошибка: {error_msg}", "#e74c3c")
+            self._set_status(f"Error: {error_msg}", "#e74c3c")
             self.image_path = None
 
     def recognize(self):
-        """Распознавание текста из изображения"""
+        """Recognize text from an image"""
         if not self.image_path:
-            self._set_status("Сначала загрузите изображение", "#e74c3c")
+            self._set_status("Load an image first", "#e74c3c")
             logger.debug("Recognize blocked: no image path")
             return
         if self.is_processing:
-            self._set_status("Распознавание уже идет", "#f39c12")
+            self._set_status("Recognition already in progress", "#f39c12")
             logger.debug("Recognize blocked: already processing")
             return
         
-        # Проверка, что файл все еще существует
+        # Verify the file still exists
         if not os.path.exists(self.image_path):
-            self._set_status("Файл был удален", "#e74c3c")
+            self._set_status("File was removed", "#e74c3c")
             logger.warning(f"Image file deleted: {self.image_path}")
             self.image_path = None
             return
@@ -552,11 +553,11 @@ class App(ctk.CTk):
         self.is_processing = True
         self.btn_run.configure(state="disabled")
         self.btn_load.configure(state="disabled")
-        self._set_status("Распознаю...", "#f39c12")
+        self._set_status("Recognizing...", "#f39c12")
         self.progress_bar.set(0)
         self._animate_progress()
         
-        # Запуск маленькой анимации-индикатора
+        # Start indicator animation
         self._start_animation_indicator()
         
         logger.info(f"Started recognition for: {self.image_path}")
@@ -569,15 +570,15 @@ class App(ctk.CTk):
                 result = self.ocr.recognize(self.image_path)
                 text = result.get("text", "")
                 if not text:
-                    text = "Текст не найден. Проверьте качество изображения и модель."
+                    text = "No text found. Check the image quality and model."
 
                 stats = []
                 if result.get("detections") is not None:
-                    stats.append(f"символы: {result.get('detections')}" )
+                    stats.append(f"symbols: {result.get('detections')}")
                 if result.get("letters") is not None:
-                    stats.append(f"буквы: {result.get('letters')}" )
+                    stats.append(f"letters: {result.get('letters')}")
                 if result.get("punct") is not None:
-                    stats.append(f"пунктуация: {result.get('punct')}" )
+                    stats.append(f"punctuation: {result.get('punct')}")
 
                 if stats:
                     text = "[" + ", ".join(stats) + "]\n\n" + text
@@ -585,7 +586,7 @@ class App(ctk.CTk):
                 logger.info("Recognition completed successfully")
                 self.after(0, lambda: self._show_result(text))
             except Exception as exc:
-                err_msg = f"Ошибка при распознавании: {str(exc)[:80]}\nПопробуйте еще раз"
+                err_msg = f"Recognition error: {str(exc)[:80]}\nPlease try again"
                 logger.error(f"Error during recognition: {exc}", exc_info=True)
                 self.after(0, lambda msg=err_msg: self._show_result(msg))
 
@@ -593,7 +594,7 @@ class App(ctk.CTk):
         thread.start()
 
     def _animate_progress(self):
-        """Анимация прогресса во время обработки"""
+        """Progress bar animation during processing"""
         if not self.is_processing:
             return
         current = self.progress_bar.get()
@@ -601,14 +602,14 @@ class App(ctk.CTk):
             self.progress_bar.set(current + 0.15)
             self.after(300, self._animate_progress)
         else:
-            # Замедляем анимацию в конце
+            # Slow down animation at the end
             self.progress_bar.set(current + 0.02)
             self.after(300, self._animate_progress)
 
     def _show_result(self, text):
-        """Отображение результата распознавания"""
+        """Display recognition result"""
         try:
-            # Остановка анимации-индикатора
+            # Stop indicator animation
             self._stop_animation_indicator()
             
             self.result_box.delete("1.0", "end")
@@ -621,30 +622,30 @@ class App(ctk.CTk):
             self.btn_run.configure(state="normal")
             self.btn_load.configure(state="normal")
             self.progress_bar.set(1.0)
-            self._set_status("Готов к работе", "#6a8a7a")
+            self._set_status("Ready", "#6a8a7a")
 
     def clear(self):
-        """Очистка интерфейса"""
+        """Clear interface"""
         if self.is_processing:
-            self._set_status("Подождите, идет обработка", "#f39c12")
+            self._set_status("Processing, please wait", "#f39c12")
             logger.debug("Clear blocked: processing in progress")
             return
         
-        # Остановка анимации если она проигрывается
+        # Stop animation if it is playing
         if self.is_showing_animation:
             self._stop_animation_indicator()
         
-        self._set_image_label(text="Перетащите изображение\nили нажмите «Загрузить фото»")
+        self._set_image_label(text='Drag image here\nor press "Load photo"')
         self._animate_frame_height(280)
         self.current_image = None
         self.result_box.delete("1.0", "end")
         self.image_path = None
         self.progress_bar.set(0)
-        self._set_status("Готов к работе", "#6a8a7a")
+        self._set_status("Ready", "#6a8a7a")
         logger.info("Application cleared")
 
     def _set_status(self, text, color="#6a8a7a"):
-        """Обновление статуса в интерфейсе"""
+        """Update status in UI"""
         self.status_label.configure(text=text, text_color=color)
 
 
