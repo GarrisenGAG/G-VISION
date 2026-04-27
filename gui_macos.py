@@ -12,7 +12,7 @@ import numpy as np
 
 # Constants
 __version__ = "1.0.0"
-APP_NAME = "G-Vision OCR"
+APP_NAME = "G-Vision"
 WINDOW_WIDTH = 900
 WINDOW_HEIGHT = 700
 MIN_WIDTH = 700
