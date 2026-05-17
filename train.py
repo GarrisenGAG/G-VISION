@@ -1,226 +1,261 @@
 #!/usr/bin/env python3
-"""
-G-VISION OCR — Handwritten Optimizer
-
-Rewritten trainer and model architecture for improved handwritten text recognition,
-optimized for training speed and recognition quality.
-"""
-
 import argparse
 import random
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.allow_tf32 = False
-torch.set_float32_matmul_precision('high')
+try:
+    from numba import jit
+except ImportError:
+    def jit(**kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+from PIL import Image, ImageFilter
+
+
+class SystemLogger:
+    def __init__(self, log_path: Optional[Path] = None):
+        self.log_path = log_path
+        if log_path:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        print(line)
+        if self.log_path:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] {message}\n")
 
 
 @dataclass
-class Cfg:
-    BASE_DIR: Path = Path("DataSet/Train")
-    CACHE_PATH: Path = Path("DataSet/dataset_cache_clean.pt")
-
-    IMG_HEIGHT: int = 64
-    MAX_WIDTH: int = 1024
-
-    BATCH_SIZE: int = 16
-    GRADIENT_ACCUMULATION: int = 2
-    NUM_WORKERS: int = 0
-    PREFETCH_FACTOR: int = 2
-    USE_AMP: bool = False
-    USE_COMPILE: bool = False
-    VAL_FREQUENCY: int = 1
-    RESUME: bool = True
-
-    LR: float = 6e-4
-    WEIGHT_DECAY: float = 1e-4
-    GRAD_CLIP: float = 1.0
-    EPOCHS: int = 60
-    PATIENCE: int = 10
-    WARMUP_EPOCHS: int = 5
-
-    MAX_SAMPLES: int = 150_000
-
-    AUG_PROB: float = 0.75
-    AUG_ROTATE: float = 3.0
-
-    DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-    SAVE_DIR: Path = Path("runs/ocr_final")
-    MODEL_NAME: str = "best_model.pt"
-    LOG_FILE: str = "training_log.txt"
-    SEED: int = 42
-
-VOCAB_LIST = ["<blank>", " "] + \
-    list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя") + \
-    list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ") + \
-    list("0123456789") + \
-    list(".,!?;:-—()[]«»\"'/@#№$%&*+=<>~^_{}|\\")
-
-CHAR2IDX = {ch: i for i, ch in enumerate(VOCAB_LIST)}
-IDX2CHAR = {i: ch for ch, i in CHAR2IDX.items()}
-VOCAB_SIZE = len(VOCAB_LIST)
+class SessionParameters:
+    base_dir: Path = Path("DataSet/Train")
+    cache_path: Path = Path("DataSet/dataset_cache_clean.pt")
+    img_height: int = 64
+    max_width: int = 1024
+    batch_size: int = 32
+    gradient_accumulation: int = 1
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    use_amp: bool = False
+    use_compile: bool = False
+    val_frequency: int = 1
+    resume: bool = True
+    learning_rate: float = 1e-4
+    weight_decay: float = 5e-4
+    grad_clip: float = 1.0
+    epochs: int = 100
+    patience: int = 20
+    warmup_epochs: int = 5
+    max_samples: int = 3_003_000
+    aug_prob: float = 0.60
+    aug_rotate: float = 4.0
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    save_dir: Path = Path("runs/ocr_final")
+    model_name: str = "best_model.pt"
+    log_file: str = "training_log.txt"
+    seed: int = 42
 
 
-def set_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+class SymbolEncoder:
+    def __init__(self):
+        self.vocabulary = ["<blank>", " "] + \
+            list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя") + \
+            list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ") + \
+            list("0123456789") + \
+            list(".,!?;:-—()[]«»\"'/@#№$%&*+=<>~^_{}|\\")
+        self.char_to_idx = {ch: i for i, ch in enumerate(self.vocabulary)}
+        self.idx_to_char = {i: ch for ch, i in self.char_to_idx.items()}
+        self.size = len(self.vocabulary)
 
+    def encode(self, text: str) -> List[int]:
+        return [self.char_to_idx.get(ch, 0) for ch in text]
 
-def log(msg: str, lf: str | None = None) -> None:
-    t = time.strftime("%H:%M:%S")
-    line = f"[{t}] {msg}"
-    print(line)
-    if lf:
-        with open(lf, 'a', encoding='utf-8') as f:
-            f.write(f"[{t}] {msg}\n")
-
-
-def levenshtein(s1: str, s2: str) -> int:
-    if len(s1) < len(s2):
-        return levenshtein(s2, s1)
-    if not s2:
-        return len(s1)
-    prev = list(range(len(s2) + 1))
-    for c1 in s1:
-        curr = [prev[0] + 1]
-        for j, c2 in enumerate(s2):
-            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
-        prev = curr
-    return prev[-1]
-
-
-def calc_cer(pred: str, target: str) -> float:
-    if not target:
-        return 0.0 if not pred else 1.0
-    return levenshtein(pred, target) / len(target)
-
-
-def ctc_greedy_decode(sequence: np.ndarray) -> str:
-    output = []
-    prev = None
-    for idx in sequence:
-        idx = int(idx)
-        if idx == prev or idx == 0:
+    def decode(self, indices: List[int], merge_repeats: bool = True, skip_blank: bool = True) -> str:
+        output = []
+        prev = -1
+        for idx in indices:
+            if merge_repeats and idx == prev:
+                continue
+            if skip_blank and idx == 0:
+                prev = idx
+                continue
+            output.append(self.idx_to_char.get(idx, ""))
             prev = idx
-            continue
-        output.append(IDX2CHAR.get(idx, ""))
-        prev = idx
-    return ''.join(output)
+        return "".join(output)
 
 
-class HandwrittenAugment:
-    def __init__(self) -> None:
-        self.blur = ImageFilter.GaussianBlur
-
-    def __call__(self, img: Image.Image) -> Image.Image:
-        if random.random() > C.AUG_PROB:
-            return img
-
-        if random.random() < 0.35:
-            img = img.filter(self.blur(radius=random.uniform(0.5, 1.5)))
-        if random.random() < 0.45:
-            img = ImageEnhance.Brightness(img).enhance(random.uniform(0.70, 1.30))
-        if random.random() < 0.45:
-            img = ImageEnhance.Contrast(img).enhance(random.uniform(0.70, 1.30))
-        if random.random() < 0.25:
-            img = ImageEnhance.Sharpness(img).enhance(random.uniform(0.7, 1.3))
-        if random.random() < 0.35:
-            img = img.rotate(random.uniform(-C.AUG_ROTATE, C.AUG_ROTATE), fillcolor=255)
-        if random.random() < 0.18:
-            img = self._add_noise(img)
-        if random.random() < 0.20:
-            img = ImageOps.autocontrast(img)
-        return img
+class AlignmentEvaluator:
+    @staticmethod
+    def levenshtein(s1: str, s2: str) -> int:
+        if len(s1) < len(s2):
+            return AlignmentEvaluator.levenshtein(s2, s1)
+        if not s2:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for c1 in s1:
+            curr = [prev[0] + 1]
+            for j, c2 in enumerate(s2):
+                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+            prev = curr
+        return prev[-1]
 
     @staticmethod
-    def _add_noise(img: Image.Image) -> Image.Image:
-        arr = np.array(img).astype(np.float32) / 255.0
-        arr += np.random.randn(*arr.shape) * 0.04
-        arr = np.clip(arr, 0.0, 1.0)
-        return Image.fromarray((arr * 255).astype(np.uint8))
+    @jit(nopython=True)
+    def _levenshtein_fast(s1_codes, s2_codes):
+        len1, len2 = len(s1_codes), len(s2_codes)
+        if len1 < len2:
+            s1_codes, s2_codes = s2_codes, s1_codes
+            len1, len2 = len2, len1
+        if len2 == 0:
+            return len1
+        prev = np.arange(len2 + 1, dtype=np.int32)
+        curr = np.zeros(len2 + 1, dtype=np.int32)
+        for i in range(len1):
+            curr[0] = i + 1
+            for j in range(len2):
+                cost = 0 if s1_codes[i] == s2_codes[j] else 1
+                curr[j + 1] = min(prev[j + 1] + 1, curr[j] + 1, prev[j] + cost)
+            prev, curr = curr, prev
+        return prev[len2]
+
+    @staticmethod
+    def compute_distance(s1: str, s2: str) -> float:
+        if len(s1) < len(s2):
+            s1, s2 = s2, s1
+        if not s2:
+            return float(len(s1))
+        if len(s1) < 5 and len(s2) < 5:
+            return float(AlignmentEvaluator.levenshtein(s1, s2))
+        try:
+            s1_codes = np.array([ord(c) for c in s1], dtype=np.int32)
+            s2_codes = np.array([ord(c) for c in s2], dtype=np.int32)
+            return float(AlignmentEvaluator._levenshtein_fast(s1_codes, s2_codes))
+        except Exception:
+            return float(AlignmentEvaluator.levenshtein(s1, s2))
+
+    @staticmethod
+    def calculate_error_rate(prediction: str, target: str) -> float:
+        if not target:
+            return 0.0 if not prediction else 1.0
+        return AlignmentEvaluator.compute_distance(prediction, target) / len(target)
 
 
-class OCRDataset(Dataset):
-    def __init__(self, paths: list[Path | str], texts: list[str], augment: bool = False) -> None:
+class VisualAugmentor:
+    def __init__(self, probability: float = 0.60, rotation_limit: float = 4.0):
+        self.probability = probability
+        self.rotation_limit = rotation_limit
+        self.blur_filter = ImageFilter.GaussianBlur
+
+    @staticmethod
+    @jit(nopython=True)
+    def _adjust_brightness(arr, factor):
+        return np.clip(arr * factor, 0.0, 1.0)
+
+    @staticmethod
+    @jit(nopython=True)
+    def _adjust_contrast(arr, factor):
+        mean = np.mean(arr)
+        adjusted = (arr - mean) * factor + mean
+        return np.clip(adjusted, 0.0, 1.0)
+
+    @staticmethod
+    @jit(nopython=True)
+    def _apply_noise(arr, std):
+        noise = np.random.randn(arr.shape[0], arr.shape[1]) * std
+        return np.clip(arr + noise, 0.0, 1.0)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() > self.probability:
+            return image
+        if random.random() < 0.40:
+            arr = np.array(image).astype(np.float32) / 255.0
+            arr = self._adjust_brightness(arr, random.uniform(0.70, 1.30))
+            image = Image.fromarray((arr * 255).astype(np.uint8))
+        if random.random() < 0.40:
+            arr = np.array(image).astype(np.float32) / 255.0
+            arr = self._adjust_contrast(arr, random.uniform(0.70, 1.30))
+            image = Image.fromarray((arr * 255).astype(np.uint8))
+        if random.random() < 0.25:
+            image = image.filter(self.blur_filter(radius=random.uniform(0.5, 1.5)))
+        if random.random() < 0.35:
+            image = image.rotate(random.uniform(-self.rotation_limit, self.rotation_limit), fillcolor=255, expand=False)
+        if random.random() < 0.15:
+            arr = np.array(image).astype(np.float32) / 255.0
+            arr = self._apply_noise(arr, 0.03)
+            image = Image.fromarray((arr * 255).astype(np.uint8))
+        return image
+
+
+class ImageSequenceDataset(Dataset):
+    def __init__(self, paths: List[Path], texts: List[str], encoder: SymbolEncoder, apply_augmentation: bool = False, params: Optional[SessionParameters] = None):
         self.paths = paths
         self.texts = texts
-        self.augment = augment
-        self.augmentor = HandwrittenAugment()
+        self.encoder = encoder
+        self.apply_augmentation = apply_augmentation
+        self.transformer = VisualAugmentor(params.aug_prob, params.aug_rotate) if apply_augmentation else None
+        self.target_height = params.img_height
+        self.max_width = params.max_width
 
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         img_path = self.paths[idx]
         text = self.texts[idx]
-
         try:
-            img = Image.open(img_path).convert('L')
+            img = Image.open(img_path).convert("L")
         except Exception:
-            img = Image.new('L', (128, C.IMG_HEIGHT), 255)
-
-        if self.augment:
-            img = self.augmentor(img)
-
+            img = Image.new("L", (128, self.target_height), 255)
+        if self.apply_augmentation and self.transformer:
+            img = self.transformer(img)
         width, height = img.size
-        if height != C.IMG_HEIGHT:
-            width = max(32, int(round(width * (C.IMG_HEIGHT / height))))
-            img = img.resize((width, C.IMG_HEIGHT), Image.Resampling.LANCZOS)
-        if img.width > C.MAX_WIDTH:
-            img = img.resize((C.MAX_WIDTH, C.IMG_HEIGHT), Image.Resampling.LANCZOS)
-
+        if height != self.target_height:
+            width = max(32, int(round(width * (self.target_height / height))))
+            img = img.resize((width, self.target_height), Image.Resampling.LANCZOS)
+        if img.width > self.max_width:
+            img = img.resize((self.max_width, self.target_height), Image.Resampling.LANCZOS)
         tensor = transforms.ToTensor()(img)
         tensor = 1.0 - tensor
-
-        ids = [CHAR2IDX.get(ch, 0) for ch in text]
-        return {
-            'img': tensor,
-            'ids': torch.tensor(ids, dtype=torch.long),
-            'txt': text,
-            'len': len(ids)
-        }
+        ids = torch.tensor(self.encoder.encode(text), dtype=torch.long)
+        return {"img": tensor, "ids": ids, "text": text, "len": len(ids)}
 
 
-def collate(batch: list[dict]) -> dict:
-    max_width = min(max(item['img'].shape[-1] for item in batch), C.MAX_WIDTH)
+def assemble_batch(batch: List[Dict[str, Any]], params: SessionParameters) -> Dict[str, Any]:
+    max_width = min(max(item["img"].shape[-1] for item in batch), params.max_width)
     batch_size = len(batch)
-
-    imgs = torch.zeros(batch_size, 1, C.IMG_HEIGHT, max_width)
-    ids = []
+    imgs = torch.zeros(batch_size, 1, params.img_height, max_width)
     lengths = []
     texts = []
-
     for i, item in enumerate(batch):
-        width = item['img'].shape[-1]
-        imgs[i, :, :, :width] = item['img']
-        ids.append(item['ids'])
-        lengths.append(item['len'])
-        texts.append(item['txt'])
-
+        width = item["img"].shape[-1]
+        imgs[i, :, :, :width] = item["img"]
+        lengths.append(item["len"])
+        texts.append(item["text"])
     return {
-        'imgs': imgs,
-        'ids': torch.cat(ids),
-        'lens': torch.tensor(lengths, dtype=torch.long),
-        'txts': texts
+        "imgs": imgs,
+        "ids": torch.cat([item["ids"] for item in batch]),
+        "lens": torch.tensor(lengths, dtype=torch.long),
+        "texts": texts
     }
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel: int = 3, padding: int = 1, pool: tuple[int, int] | None = None) -> None:
+class SpatialLayer(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel: int = 3, padding: int = 1, pool: Optional[Tuple[int, int]] = None):
         super().__init__()
         layers = [
             nn.Conv2d(in_channels, out_channels, kernel, padding=padding, bias=False),
@@ -235,8 +270,8 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+class ResidualUnit(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
         self.body = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
@@ -251,453 +286,390 @@ class ResidualBlock(nn.Module):
         return self.act(x + self.body(x))
 
 
-class CRNN(nn.Module):
-    def __init__(self, n_classes: int, hidden_size: int = 320, use_final_conv: bool = True, legacy: bool = False) -> None:
+class SequenceAligner(nn.Module):
+    def __init__(self, output_dim: int, hidden_size: int = 320, use_final_conv: bool = True, legacy: bool = False):
         super().__init__()
         layers = [
-            ConvBlock(1, 64, pool=(2, 2)),
-            ResidualBlock(64),
-            ConvBlock(64, 128, pool=(2, 2)),
-            ResidualBlock(128),
-            ConvBlock(128, 256, pool=(2, 1)),
-            ResidualBlock(256),
-            ConvBlock(256, 512, pool=(2, 1)),
+            SpatialLayer(1, 64, pool=(2, 2)),
+            ResidualUnit(64),
+            SpatialLayer(64, 128, pool=(2, 2)),
+            ResidualUnit(128),
+            SpatialLayer(128, 256, pool=(2, 1)),
+            ResidualUnit(256),
+            SpatialLayer(256, 512, pool=(2, 1)),
         ]
         if legacy:
-            layers.append(ConvBlock(512, 512, kernel=2, padding=0))
+            layers.append(SpatialLayer(512, 512, kernel=2, padding=0))
         else:
-            layers.append(ResidualBlock(512))
+            layers.append(ResidualUnit(512))
             if use_final_conv:
-                layers.append(ConvBlock(512, 512, kernel=2, padding=0))
-        self.cnn = nn.Sequential(*layers)
+                layers.append(SpatialLayer(512, 512, kernel=2, padding=0))
+        self.extractor = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d((1, None))
-        self.rnn = nn.LSTM(512, hidden_size, num_layers=2, bidirectional=True, batch_first=True, dropout=0.3)
-        self.classifier = nn.Sequential(
+        self.recurrence = nn.LSTM(512, hidden_size, num_layers=2, bidirectional=True, batch_first=True, dropout=0.5)
+        self.projection = nn.Sequential(
             nn.LayerNorm(hidden_size * 2),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_size * 2, n_classes)
+            nn.Dropout(0.5),
+            nn.Linear(hidden_size * 2, output_dim)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.cnn(x)
+        x = self.extractor(x)
         x = self.pool(x)
         x = x.squeeze(2).permute(0, 2, 1)
-        x, _ = self.rnn(x)
-        x = self.classifier(x)
+        x, _ = self.recurrence(x)
+        x = self.projection(x)
         return x.permute(1, 0, 2).log_softmax(2)
 
 
-class Trainer:
-    def __init__(self, model: CRNN, device: torch.device, steps_per_epoch: int) -> None:
-        self.model = model
+class PipelineController:
+    def __init__(self, aligner: nn.Module, device: torch.device, steps_per_epoch: int, params: SessionParameters):
+        self.aligner = aligner
         self.device = device
-        self.ctc = nn.CTCLoss(blank=0, zero_infinity=True, reduction='mean')
-        self.scaler = GradScaler(enabled=(self.device.type == 'cuda' and C.USE_AMP))
-        self.opt = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
-        pct_start = min(1.0, C.WARMUP_EPOCHS / max(1, C.EPOCHS))
-        self.sched = torch.optim.lr_scheduler.OneCycleLR(
-            self.opt,
-            max_lr=C.LR,
-            epochs=C.EPOCHS,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=pct_start,
-            div_factor=10,
-            final_div_factor=100
+        self.loss_fn = nn.CTCLoss(blank=0, zero_infinity=True, reduction="mean")
+        self.scaler = GradScaler(enabled=(self.device.type == "cuda" and params.use_amp))
+        self.optimizer = torch.optim.AdamW(aligner.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
+        warmup_epochs = min(params.warmup_epochs, max(1, params.epochs - 1))
+        pct_start = max(0.1, min(0.95, warmup_epochs / max(1, params.epochs)))
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer, max_lr=params.learning_rate, epochs=params.epochs,
+            steps_per_epoch=steps_per_epoch, pct_start=pct_start, div_factor=10, final_div_factor=100
         )
-        self.best_cer = 1.0
-        self.patience = 0
+        self.best_metric = 1.0
+        self.patience_counter = 0
+        self.params = params
 
-    def train_epoch(self, loader: DataLoader) -> float:
-        self.model.train()
+    def execute_training_pass(self, loader: DataLoader) -> float:
+        self.aligner.train()
         total_loss = 0.0
         total_samples = 0
-        self.opt.zero_grad()
+        self.optimizer.zero_grad()
 
-        for step, batch in enumerate(tqdm(loader, desc='Train', ncols=100, leave=False), start=1):
-            x = batch['imgs'].to(self.device, non_blocking=True)
-            y = batch['ids'].to(self.device, non_blocking=True)
-            lengths = batch['lens'].to(self.device, non_blocking=True)
+        for step, batch in enumerate(tqdm(loader, desc="Training", ncols=100, leave=False), start=1):
+            x = batch["imgs"].to(self.device, non_blocking=True)
+            y = batch["ids"].to(self.device, non_blocking=True)
+            lengths = batch["lens"].to(self.device, non_blocking=True)
 
-            with autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda' and C.USE_AMP)):
-                logits = self.model(x)
+            with autocast(device_type=self.device.type, enabled=(self.device.type == "cuda" and self.params.use_amp)):
+                logits = self.aligner(x)
                 input_lengths = torch.full((x.size(0),), logits.size(0), dtype=torch.long, device=self.device)
-                loss = self.ctc(logits, y, input_lengths, lengths)
+                loss = self.loss_fn(logits, y, input_lengths, lengths)
 
             if torch.isnan(loss):
-                self.opt.zero_grad()
+                self.optimizer.zero_grad()
                 continue
 
-            loss = loss / C.GRADIENT_ACCUMULATION
+            loss = loss / self.params.gradient_accumulation
             self.scaler.scale(loss).backward()
 
-            if step % C.GRADIENT_ACCUMULATION == 0 or step == len(loader):
-                self.scaler.unscale_(self.opt)
-                nn.utils.clip_grad_norm_(self.model.parameters(), C.GRAD_CLIP)
-                self.scaler.step(self.opt)
+            if step % self.params.gradient_accumulation == 0 or step == len(loader):
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.aligner.parameters(), self.params.grad_clip)
+                self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.sched.step()
-                self.opt.zero_grad()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
 
-            total_loss += loss.item() * C.GRADIENT_ACCUMULATION * x.size(0)
+            total_loss += loss.item() * self.params.gradient_accumulation * x.size(0)
             total_samples += x.size(0)
 
         return total_loss / max(total_samples, 1)
 
-    def val_epoch(self, loader: DataLoader) -> tuple[float, float]:
-        self.model.eval()
+    def execute_evaluation_pass(self, loader: DataLoader, encoder: SymbolEncoder) -> Tuple[float, float]:
+        self.aligner.eval()
         total_loss = 0.0
-        cers = []
+        metrics = []
 
         with torch.no_grad():
-            for batch in tqdm(loader, desc='Val', ncols=100, leave=False):
-                x = batch['imgs'].to(self.device, non_blocking=True)
-                y = batch['ids'].to(self.device, non_blocking=True)
-                lengths = batch['lens'].to(self.device, non_blocking=True)
+            for batch in tqdm(loader, desc="Evaluation", ncols=100, leave=False):
+                x = batch["imgs"].to(self.device, non_blocking=True)
+                y = batch["ids"].to(self.device, non_blocking=True)
+                lengths = batch["lens"].to(self.device, non_blocking=True)
 
-                logits = self.model(x).float()
+                logits = self.aligner(x).float()
                 input_lengths = torch.full((x.size(0),), logits.size(0), dtype=torch.long, device=self.device)
-                loss = self.ctc(logits, y, input_lengths, lengths)
+                loss = self.loss_fn(logits, y, input_lengths, lengths)
                 total_loss += loss.item() * x.size(0)
 
                 preds = logits.argmax(2).cpu().numpy().T
-                for seq, target in zip(preds, batch['txts']):
-                    pred_text = ctc_greedy_decode(seq)
-                    cers.append(calc_cer(pred_text, target))
+                for seq, target in zip(preds, batch["texts"]):
+                    decoded = encoder.decode(seq.tolist())
+                    metrics.append(AlignmentEvaluator.calculate_error_rate(decoded, target))
 
-        return total_loss / max(1, len(loader.dataset)), float(np.mean(cers))
+        return total_loss / max(1, len(loader.dataset)), float(np.mean(metrics))
 
-    def save(self, path: Path, metrics: dict, is_best: bool = False) -> None:
+    def persist_state(self, path: Path, metrics: Dict[str, Any], is_best: bool = False) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({'model': self.model.state_dict(), 'metrics': metrics, 'best': is_best}, path)
-        log(f'Model saved to {path}')
+        torch.save({"aligner": self.aligner.state_dict(), "metrics": metrics, "best": is_best}, path)
 
-    def save_checkpoint(self, path: Path, epoch: int) -> None:
+    def persist_checkpoint(self, path: Path, epoch: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint = {
-            'epoch': epoch,
-            'model_state': self.model.state_dict(),
-            'opt_state': self.opt.state_dict(),
-            'sched_state': self.sched.state_dict(),
-            'best_cer': self.best_cer,
-            'patience': self.patience
+        torch.save({
+            "epoch": epoch, "aligner_state": self.aligner.state_dict(),
+            "opt_state": self.optimizer.state_dict(),
+            "sched_state": self.scheduler.state_dict(),
+            "best_metric": self.best_metric, "patience": self.patience_counter
+        }, path)
+
+    def restore_checkpoint(self, path: Path) -> int:
+        state = torch.load(path, map_location=self.device)
+        self.aligner.load_state_dict(state["aligner_state"])
+        self.optimizer.load_state_dict(state["opt_state"])
+        self.scheduler.load_state_dict(state["sched_state"])
+        self.best_metric = state.get("best_metric", self.best_metric)
+        self.patience_counter = state.get("patience", self.patience_counter)
+        return state.get("epoch", 0)
+
+
+class Orchestrator:
+    def __init__(self):
+        self.params = SessionParameters()
+        self.logger = SystemLogger()
+        self.encoder = SymbolEncoder()
+
+    def parse_arguments(self) -> argparse.Namespace:
+        parser = argparse.ArgumentParser(description="Sequence alignment and processing pipeline")
+        parser.add_argument("--mode", choices=["train", "eval", "infer"], default="train")
+        parser.add_argument("--infer-path", type=str, nargs="+", default=None)
+        parser.add_argument("--sample-count", type=int, default=10)
+        parser.add_argument("--resume", action="store_true", default=True)
+        parser.add_argument("--no-resume", action="store_false", dest="resume")
+        parser.add_argument("--epochs", type=int, default=None)
+        parser.add_argument("--batch-size", type=int, default=None)
+        parser.add_argument("--max-samples", type=int, default=None)
+        parser.add_argument("--num-workers", type=int, default=None)
+        parser.add_argument("--learning-rate", type=float, default=None)
+        parser.add_argument("--val-frequency", type=int, default=None)
+        parser.add_argument("--seed", type=int, default=None)
+        return parser.parse_args()
+
+    def apply_arguments(self, args: argparse.Namespace) -> None:
+        if args.infer_path:
+            args.infer_path = " ".join(args.infer_path)
+        self.params.resume = args.resume
+        if args.epochs is not None:
+            self.params.epochs = args.epochs
+        if args.batch_size is not None:
+            self.params.batch_size = args.batch_size
+        if args.max_samples is not None:
+            self.params.max_samples = args.max_samples
+        if args.num_workers is not None:
+            self.params.num_workers = args.num_workers
+        if args.learning_rate is not None:
+            self.params.learning_rate = args.learning_rate
+        if args.val_frequency is not None:
+            self.params.val_frequency = args.val_frequency
+        if args.seed is not None:
+            self.params.seed = args.seed
+
+    def setup_environment(self) -> torch.device:
+        random.seed(self.params.seed)
+        np.random.seed(self.params.seed)
+        torch.manual_seed(self.params.seed)
+        torch.cuda.manual_seed_all(self.params.seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("high")
+
+        device = torch.device(self.params.device)
+        if device.type == "cuda":
+            try:
+                torch.cuda.init()
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.empty_cache()
+            except RuntimeError as e:
+                self.logger(f"CUDA initialization failed: {e}. Falling back to CPU.")
+                device = torch.device("cpu")
+        return device
+
+    def load_data(self) -> Tuple[List[Path], List[str]]:
+        if not self.params.cache_path.exists():
+            self.logger("Cache file not found. Please generate dataset cache first.")
+            sys.exit(1)
+        cached = torch.load(self.params.cache_path, weights_only=False)
+        paths, texts = cached["image_paths"], cached["texts"]
+        if len(paths) > self.params.max_samples:
+            selected = random.sample(range(len(paths)), self.params.max_samples)
+            paths = [paths[i] for i in selected]
+            texts = [texts[i] for i in selected]
+        return paths, texts
+
+    def prepare_loaders(self, paths: List[Path], texts: List[str], device: torch.device) -> Tuple[DataLoader, DataLoader]:
+        indices = list(range(len(paths)))
+        random.shuffle(indices)
+        n_train = int(len(paths) * 0.90)
+        n_val = int(len(paths) * 0.05)
+        train_paths = [paths[i] for i in indices[:n_train]]
+        train_texts = [texts[i] for i in indices[:n_train]]
+        val_paths = [paths[i] for i in indices[n_train:n_train + n_val]]
+        val_texts = [texts[i] for i in indices[n_train:n_train + n_val]]
+
+        train_ds = ImageSequenceDataset(train_paths, train_texts, self.encoder, True, self.params)
+        val_ds = ImageSequenceDataset(val_paths, val_texts, self.encoder, False, self.params)
+
+        loader_args = {
+            "collate_fn": lambda b: assemble_batch(b, self.params),
+            "pin_memory": device.type == "cuda",
+            "persistent_workers": self.params.num_workers > 0,
         }
-        torch.save(checkpoint, path)
-        log(f'Checkpoint saved: {path}')
+        if self.params.num_workers > 0:
+            loader_args["prefetch_factor"] = self.params.prefetch_factor
 
-    def load_checkpoint(self, path: Path, device: torch.device) -> int:
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state'])
-        self.opt.load_state_dict(checkpoint['opt_state'])
-        self.sched.load_state_dict(checkpoint['sched_state'])
-        self.best_cer = checkpoint.get('best_cer', self.best_cer)
-        self.patience = checkpoint.get('patience', self.patience)
-        return checkpoint.get('epoch', 0)
+        train_loader = DataLoader(train_ds, batch_size=self.params.batch_size, shuffle=True, num_workers=self.params.num_workers, drop_last=True, **loader_args)
+        val_loader = DataLoader(val_ds, batch_size=self.params.batch_size, shuffle=False, num_workers=self.params.num_workers, drop_last=False, **loader_args)
+        return train_loader, val_loader
 
+    def initialize_aligner(self, device: torch.device, weights: Optional[Dict] = None) -> SequenceAligner:
+        legacy = False
+        use_final_conv = True
+        hidden_size = 320
+        if weights:
+            if "rnn.weight_ih_l0" in weights and weights["rnn.weight_ih_l0"].shape[0] == 1024:
+                legacy = True
+            if "classifier.2.weight" in weights and weights["classifier.2.weight"].shape[1] == 512:
+                legacy = True
+            if "cnn.7.block.0.weight" in weights or "cnn.7.block.1.weight" in weights:
+                use_final_conv = True
+            elif "cnn.8.block.0.weight" in weights or "cnn.8.block.1.weight" in weights:
+                use_final_conv = True
+            hidden_size = 256 if legacy else 320
 
-def load_model_weights(path: Path, model: CRNN, device: torch.device) -> dict:
-    state = torch.load(path, map_location=device, weights_only=False)
-    weights = state.get('model', state)
+        aligner = SequenceAligner(self.encoder.size, hidden_size, use_final_conv, legacy).to(device)
+        if weights:
+            compatible = {k: v for k, v in weights.items() if k in aligner.state_dict() and v.shape == aligner.state_dict()[k].shape}
+            aligner.load_state_dict(compatible, strict=False)
+        return aligner
 
-    model_state = model.state_dict()
-    loadable = {}
-    skipped = []
+    def run_inference(self, aligner: SequenceAligner, image_path: str, device: torch.device) -> str:
+        aligner.eval()
+        img = Image.open(image_path).convert("L")
+        width, height = img.size
+        if height != self.params.img_height:
+            width = max(32, int(round(width * (self.params.img_height / height))))
+            img = img.resize((width, self.params.img_height), Image.Resampling.LANCZOS)
+        if img.width > self.params.max_width:
+            img = img.resize((self.params.max_width, self.params.img_height), Image.Resampling.LANCZOS)
+        tensor = transforms.ToTensor()(img)
+        tensor = (1.0 - tensor).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = aligner(tensor)
+        seq = logits.argmax(2).cpu().numpy().T[0]
+        return self.encoder.decode(seq.tolist())
 
-    for key, value in weights.items():
-        if key not in model_state:
-            skipped.append((key, 'missing'))
-            continue
-        if value.shape != model_state[key].shape:
-            skipped.append((key, f'{value.shape}->{model_state[key].shape}'))
-            continue
-        loadable[key] = value
+    def execute(self) -> None:
+        args = self.parse_arguments()
+        self.apply_arguments(args)
+        self.logger("=" * 60)
+        self.logger("Sequence Alignment Pipeline Started")
+        self.logger(f"Mode: {args.mode}")
+        self.logger("=" * 60)
 
-    model.load_state_dict(loadable, strict=False)
-
-    if skipped:
-        log(f'Warning: {len(skipped)} parameters skipped during loading {path.name}:')
-        for key, reason in skipped[:10]:
-            log(f'   - {key}: {reason}')
-        if len(skipped) > 10:
-            log(f'   ... and {len(skipped) - 10} more parameters skipped')
-    else:
-        log(f'Loaded {len(loadable)} parameters from {path.name}')
-
-    return state
-
-
-def is_legacy_checkpoint(weights: dict) -> bool:
-    if 'rnn.weight_ih_l0' in weights and weights['rnn.weight_ih_l0'].shape[0] == 1024:
-        return True
-    if 'classifier.2.weight' in weights and weights['classifier.2.weight'].shape[1] == 512:
-        return True
-    return False
-
-
-def load_checkpoint_weights(path: Path, device: torch.device) -> dict:
-    state = torch.load(path, map_location=device, weights_only=False)
-    return state.get('model', state)
-
-
-def build_model_for_weights(weights: dict, n_classes: int) -> CRNN:
-    legacy = is_legacy_checkpoint(weights)
-    legacy_conv = 'cnn.7.block.0.weight' in weights or 'cnn.7.block.1.weight' in weights
-    new_conv = 'cnn.8.block.0.weight' in weights or 'cnn.8.block.1.weight' in weights
-    use_final_conv = legacy_conv or new_conv
-    hidden_size = 256 if legacy else 320
-    model = CRNN(n_classes, hidden_size=hidden_size, use_final_conv=use_final_conv, legacy=legacy)
-    if legacy:
-        log('Legacy checkpoint detected: building compatible architecture')
-    return model
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='G-VISION OCR trainer/evaluator')
-    parser.add_argument('--mode', choices=['train', 'eval', 'infer'], default='train',
-                        help='train: continue training; eval: run validation check; infer: recognize one image')
-    parser.add_argument('--infer-path', type=str, nargs='+', default=None,
-                        help='Path to a single image for inference when mode=infer')
-    parser.add_argument('--sample-count', type=int, default=10,
-                        help='Number of validation samples to print during eval')
-    parser.add_argument('--resume', action='store_true', dest='resume', default=True,
-                        help='Resume from checkpoint or best_model.pt if available (default)')
-    parser.add_argument('--no-resume', action='store_false', dest='resume',
-                        help='Do not resume from checkpoint or best_model.pt; train from scratch')
-    parser.add_argument('--epochs', type=int, default=None,
-                        help='Override number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=None,
-                        help='Override batch size for training and evaluation')
-    parser.add_argument('--max-samples', type=int, default=None,
-                        help='Limit the number of samples used for training/validation')
-    parser.add_argument('--num-workers', type=int, default=None,
-                        help='Override number of DataLoader workers')
-    parser.add_argument('--learning-rate', type=float, default=None,
-                        help='Override initial learning rate')
-    parser.add_argument('--val-frequency', type=int, default=None,
-                        help='Override validation frequency in epochs')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Override random seed for dataset sampling and shuffling')
-    return parser.parse_args()
-
-
-def preprocess_image(img: Image.Image, device: torch.device) -> torch.Tensor:
-    if img.mode != 'L':
-        img = img.convert('L')
-    width, height = img.size
-    if height != C.IMG_HEIGHT:
-        width = max(32, int(round(width * (C.IMG_HEIGHT / height))))
-        img = img.resize((width, C.IMG_HEIGHT), Image.Resampling.LANCZOS)
-    if img.width > C.MAX_WIDTH:
-        img = img.resize((C.MAX_WIDTH, C.IMG_HEIGHT), Image.Resampling.LANCZOS)
-    tensor = transforms.ToTensor()(img)
-    tensor = 1.0 - tensor
-    return tensor.unsqueeze(0).to(device)
-
-
-def infer_image(image_path: str, model: CRNN, device: torch.device) -> str:
-    model.eval()
-    img = Image.open(image_path).convert('L')
-    x = preprocess_image(img, device)
-    with torch.no_grad():
-        logits = model(x)
-    seq = logits.argmax(2).cpu().numpy().T[0]
-    return ctc_greedy_decode(seq)
-
-
-def evaluate_model(model: CRNN, loader: DataLoader, device: torch.device, max_examples: int = 10) -> tuple[float, list[tuple[str, str]]]:
-    model.eval()
-    cers = []
-    examples = []
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc='Eval', ncols=100, leave=False):
-            x = batch['imgs'].to(device, non_blocking=True)
-            logits = model(x).float()
-            preds = logits.argmax(2).cpu().numpy().T
-            for seq, target in zip(preds, batch['txts']):
-                pred_text = ctc_greedy_decode(seq)
-                cers.append(calc_cer(pred_text, target))
-                if len(examples) < max_examples:
-                    examples.append((target, pred_text))
-
-    return float(np.mean(cers)), examples
-
-
-def main() -> None:
-    args = parse_args()
-    if args.infer_path:
-        args.infer_path = ' '.join(args.infer_path)
-    C.RESUME = args.resume
-    if args.epochs is not None:
-        C.EPOCHS = args.epochs
-    if args.batch_size is not None:
-        C.BATCH_SIZE = args.batch_size
-    if args.max_samples is not None:
-        C.MAX_SAMPLES = args.max_samples
-    if args.num_workers is not None:
-        C.NUM_WORKERS = args.num_workers
-    if args.learning_rate is not None:
-        C.LR = args.learning_rate
-    if args.val_frequency is not None:
-        C.VAL_FREQUENCY = args.val_frequency
-    if args.seed is not None:
-        C.SEED = args.seed
-
-    set_seed(C.SEED)
-    log('=' * 60)
-    log('G-VISION OCR — Handwritten Optimizer')
-    log(f'Mode: {args.mode}')
-    log('=' * 60)
-
-    if torch.cuda.is_available():
-        log(f'GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
-    else:
-        log('CPU-only mode: CUDA not available')
-
-    C.SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = C.SAVE_DIR / C.LOG_FILE
-
-    if not C.CACHE_PATH.exists():
-        log('Cache file not found. Please run the caching script first.')
-        sys.exit(1)
-
-    cached = torch.load(C.CACHE_PATH, weights_only=False)
-    all_paths, all_texts = cached['image_paths'], cached['texts']
-    dataset_size = len(all_paths)
-    log(f'Loaded {dataset_size:,} valid samples')
-
-    if dataset_size > C.MAX_SAMPLES:
-        selected = random.sample(range(dataset_size), C.MAX_SAMPLES)
-        all_paths = [all_paths[i] for i in selected]
-        all_texts = [all_texts[i] for i in selected]
-        dataset_size = len(all_paths)
-        log(f'Limited to {dataset_size:,} samples for training efficiency')
-
-    indices = list(range(dataset_size))
-    random.shuffle(indices)
-
-    n_train = int(dataset_size * 0.90)
-    n_val = int(dataset_size * 0.05)
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:n_train + n_val]
-
-    train_paths = [all_paths[i] for i in train_indices]
-    train_texts = [all_texts[i] for i in train_indices]
-    val_paths = [all_paths[i] for i in val_indices]
-    val_texts = [all_texts[i] for i in val_indices]
-
-    train_dataset = OCRDataset(train_paths, train_texts, augment=True)
-    val_dataset = OCRDataset(val_paths, val_texts, augment=False)
-
-    device = torch.device(C.DEVICE)
-    use_cuda = device.type == 'cuda'
-    loader_args = {
-        'collate_fn': collate,
-        'pin_memory': use_cuda,
-        'persistent_workers': C.NUM_WORKERS > 0,
-    }
-    if C.NUM_WORKERS > 0:
-        loader_args['prefetch_factor'] = C.PREFETCH_FACTOR
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=C.BATCH_SIZE,
-        shuffle=True,
-        num_workers=C.NUM_WORKERS,
-        drop_last=True,
-        **loader_args
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=C.BATCH_SIZE,
-        shuffle=False,
-        num_workers=C.NUM_WORKERS,
-        drop_last=False,
-        **loader_args
-    )
-
-    start_epoch = 1
-    checkpoint_path = C.SAVE_DIR / 'checkpoint.pt'
-    best_model_path = C.SAVE_DIR / C.MODEL_NAME
-
-    model = CRNN(VOCAB_SIZE).to(device)
-    if C.RESUME and not checkpoint_path.exists() and best_model_path.exists():
-        weights = load_checkpoint_weights(best_model_path, device)
-        model = build_model_for_weights(weights, VOCAB_SIZE).to(device)
-
-    trainer = Trainer(model, device, len(train_loader))
-
-    if C.RESUME and checkpoint_path.exists():
-        loaded_epoch = trainer.load_checkpoint(checkpoint_path, device)
-        start_epoch = min(loaded_epoch + 1, C.EPOCHS)
-        log(f'Resumed from checkpoint: epoch {loaded_epoch}, best CER={trainer.best_cer:.4f}')
-    elif C.RESUME and best_model_path.exists():
-        checkpoint = load_model_weights(best_model_path, model, device)
-        if isinstance(checkpoint, dict):
-            trainer.best_cer = checkpoint.get('metrics', {}).get('cer', trainer.best_cer)
-        log(f'Loaded weights from {best_model_path} for fine-tuning')
-
-    if args.mode in ('eval', 'infer'):
-        if args.mode == 'eval':
-            val_cer, examples = evaluate_model(trainer.model, val_loader, device, args.sample_count)
-            log(f'Evaluation complete. CER={val_cer:.4f}')
-            for idx, (target, pred) in enumerate(examples, start=1):
-                log(f'  {idx}. GT: {target}')
-                log(f'     PR: {pred}')
-            return
-
-        if args.mode == 'infer':
-            if not args.infer_path:
-                log('Please specify --infer-path for inference mode')
-                sys.exit(1)
-            pred_text = infer_image(args.infer_path, trainer.model, device)
-            log(f'Inference result: {Path(args.infer_path).name} -> {pred_text}')
-            return
-
-    if C.USE_COMPILE and hasattr(torch, 'compile'):
-        try:
-            import triton  # noqa: F401
-            model = torch.compile(model, backend='inductor', mode='reduce-overhead')
-            trainer.model = model
-            log('torch.compile enabled')
-        except ImportError:
-            log('Warning: Triton not installed, torch.compile disabled')
-        except Exception as exc:
-            log(f'Warning: torch.compile failed: {exc}')
-            log('Compilation disabled for stability')
-            C.USE_COMPILE = False
-
-    log(f'Model parameters: {sum(p.numel() for p in trainer.model.parameters()):,}')
-    log(f'Starting training: epochs={C.EPOCHS}, effective_batch={C.BATCH_SIZE * C.GRADIENT_ACCUMULATION}, lr={C.LR}, resume_from={start_epoch}')
-
-    for epoch in range(start_epoch, C.EPOCHS + 1):
-        epoch_start = time.time()
-        train_loss = trainer.train_epoch(train_loader)
-        elapsed = time.time() - epoch_start
-
-        if epoch == 1 or epoch % C.VAL_FREQUENCY == 0:
-            val_loss, val_cer = trainer.val_epoch(val_loader)
-            log(f'Epoch {epoch}/{C.EPOCHS} | Train Loss={train_loss:.4f} | Val Loss={val_loss:.4f} | CER={val_cer:.4f} | Time={elapsed/60:.1f}m', log_file)
-
-            if val_cer < trainer.best_cer:
-                trainer.best_cer = val_cer
-                trainer.patience = 0
-                trainer.save(C.SAVE_DIR / C.MODEL_NAME, {'cer': val_cer, 'epoch': epoch}, is_best=True)
-                log(f'New best CER: {val_cer:.4f}')
-            else:
-                trainer.patience += 1
-                if trainer.patience >= C.PATIENCE:
-                    log(f'Early stopping triggered at epoch {epoch}')
-                    break
+        if torch.cuda.is_available():
+            self.logger(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         else:
-            log(f'Epoch {epoch}/{C.EPOCHS} | Train Loss={train_loss:.4f} | Val skipped | Time={elapsed/60:.1f}m', log_file)
+            self.logger("CPU mode active")
 
-        if use_cuda:
-            torch.cuda.empty_cache()
+        self.params.save_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = SystemLogger(self.params.save_dir / self.params.log_file)
 
-    log('=' * 60)
-    log(f'Training completed. Best CER: {trainer.best_cer:.4f}')
-    log('=' * 60)
+        device = self.setup_environment()
+        paths, texts = self.load_data()
+        self.logger(f"Loaded {len(paths):,} valid samples")
+        if len(paths) > self.params.max_samples:
+            self.logger(f"Restricted to {len(paths):,} samples for processing speed")
+
+        train_loader, val_loader = self.prepare_loaders(paths, texts, device)
+        checkpoint_path = self.params.save_dir / "checkpoint.pt"
+        best_model_path = self.params.save_dir / self.params.model_name
+
+        weights = None
+        if self.params.resume and best_model_path.exists() and not checkpoint_path.exists():
+            state = torch.load(best_model_path, map_location=device, weights_only=False)
+            weights = state.get("aligner", state)
+
+        aligner = self.initialize_aligner(device, weights)
+        controller = PipelineController(aligner, device, len(train_loader), self.params)
+
+        start_epoch = 1
+        if self.params.resume and checkpoint_path.exists():
+            loaded_epoch = controller.restore_checkpoint(checkpoint_path)
+            start_epoch = min(loaded_epoch + 1, self.params.epochs)
+            self.logger(f"Resumed from checkpoint: epoch {loaded_epoch}, best metric={controller.best_metric:.4f}")
+        elif self.params.resume and best_model_path.exists():
+            self.logger(f"Loaded weights from {best_model_path} for continuation")
+
+        if args.mode == "eval":
+            _, val_metric = controller.execute_evaluation_pass(val_loader, self.encoder)
+            self.logger(f"Evaluation complete. Metric: {val_metric:.4f}")
+            examples = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    x = batch["imgs"].to(device, non_blocking=True)
+                    logits = aligner(x).float()
+                    preds = logits.argmax(2).cpu().numpy().T
+                    for seq, target in zip(preds, batch["texts"]):
+                        if len(examples) >= args.sample_count:
+                            break
+                        examples.append((target, self.encoder.decode(seq.tolist())))
+                    if len(examples) >= args.sample_count:
+                        break
+            for idx, (target, pred) in enumerate(examples, 1):
+                self.logger(f"  {idx}. Ground: {target}")
+                self.logger(f"     Pred:   {pred}")
+            return
+
+        if args.mode == "infer":
+            if not args.infer_path:
+                self.logger("Please provide --infer-path for inference mode")
+                sys.exit(1)
+            pred = self.run_inference(aligner, args.infer_path, device)
+            self.logger(f"Inference: {Path(args.infer_path).name} -> {pred}")
+            return
+
+        if self.params.use_compile and hasattr(torch, "compile"):
+            try:
+                import triton
+                aligner = torch.compile(aligner, backend="inductor", mode="reduce-overhead")
+                controller.aligner = aligner
+                self.logger("Compilation enabled")
+            except ImportError:
+                self.logger("Triton not available. Compilation disabled.")
+            except Exception as exc:
+                self.logger(f"Compilation failed: {exc}")
+                self.params.use_compile = False
+
+        self.logger(f"Parameters: {sum(p.numel() for p in controller.aligner.parameters()):,}")
+        self.logger(f"Starting session: epochs={self.params.epochs}, batch={self.params.batch_size * self.params.gradient_accumulation}, lr={self.params.learning_rate}, resume_from={start_epoch}")
+
+        for epoch in range(start_epoch, self.params.epochs + 1):
+            start_time = time.time()
+            train_loss = controller.execute_training_pass(train_loader)
+            elapsed = time.time() - start_time
+
+            if epoch == 1 or epoch % self.params.val_frequency == 0:
+                val_loss, val_metric = controller.execute_evaluation_pass(val_loader, self.encoder)
+                self.logger(f"Epoch {epoch}/{self.params.epochs} | Train Loss={train_loss:.4f} | Val Loss={val_loss:.4f} | Metric={val_metric:.4f} | Time={elapsed/60:.1f}m")
+
+                if val_metric < controller.best_metric:
+                    controller.best_metric = val_metric
+                    controller.patience_counter = 0
+                    controller.persist_state(self.params.save_dir / self.params.model_name, {"metric": val_metric, "epoch": epoch}, is_best=True)
+                    self.logger(f"New best metric: {val_metric:.4f}")
+                else:
+                    controller.patience_counter += 1
+                    if controller.patience_counter >= self.params.patience:
+                        self.logger(f"Early stopping at epoch {epoch}")
+                        break
+            else:
+                self.logger(f"Epoch {epoch}/{self.params.epochs} | Train Loss={train_loss:.4f} | Val=n/a | Metric=n/a | Time={elapsed/60:.1f}m")
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        self.logger("=" * 60)
+        self.logger(f"Session complete. Best metric: {controller.best_metric:.4f}")
+        self.logger("=" * 60)
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    Orchestrator().execute()
