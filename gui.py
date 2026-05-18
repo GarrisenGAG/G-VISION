@@ -11,80 +11,126 @@ from pathlib import Path
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-
 class App(ctk.CTk):
+    """Main application class for G-Vision OCR interface."""
+    
     def __init__(self):
         super().__init__()
         self.title("G-Vision")
         self.geometry("800x600")
         self.overrideredirect(True)
-
-        self.config(bg='#010101')
-        self.attributes('-transparentcolor', '#010101')
-
+        
+        # Use a dark but not pure black background for better appearance
+        self.config(bg="#121212")
+        self.attributes('-transparentcolor', '#121212')
+        
         # Animation variables
         self.is_animating = False
         self.animation_thread = None
         self.video_path = Path(__file__).parent / "wait_anim.mkv"
-
+        
+        # Main padding frame
         self.pad = ctk.CTkFrame(self,
                                 fg_color="#0a133b",
                                 corner_radius=30,
-                                bg_color='#010101')
+                                bg_color="#121212")
         self.pad.pack(fill="both", expand=True, padx=15, pady=15)
-
+        
+        # Left panel
         self.left = ctk.CTkFrame(self.pad,
                                  fg_color="#24306e",
                                  width=200,
                                  corner_radius=20)
         self.left.pack(side="left", fill="y", padx=10, pady=10)
-
+        
+        # Right panel
         self.right = ctk.CTkFrame(self.pad,
                                   fg_color="#08103b",
                                   corner_radius=20)
         self.right.pack(side="right", fill="both", expand=True, padx=10, pady=10)
-
+        
+        # Close button (top-right corner)
+        self.close_btn = ctk.CTkButton(self.pad, text="✕", width=30, height=30,
+                                       corner_radius=15, fg_color="#ff4d4d",
+                                       hover_color="#ff0000",
+                                       command=self.close_window)
+        self.close_btn.place(relx=0.98, rely=0.02, anchor="ne")
+        
+        # Enable dragging the window by the left panel
+        self.left.bind('<ButtonPress-1>', self.start_move)
+        self.left.bind('<B1-Motion>', self.do_move)
+        
+        # Load button
         self.btn_load = ctk.CTkButton(self.left, text="Load photo",
                                       font=ctk.CTkFont(family="Arial", size=16, weight="bold"),
                                       command=self.load_image, fg_color="#08103b")
         self.btn_load.pack(pady=10, padx=10)
-
+        
+        # Run button
         self.btn_run = ctk.CTkButton(self.left, text="Recognize",
                                      font=ctk.CTkFont(family="Arial", size=16, weight="bold"),
                                      command=self.recognize, fg_color="#08103b")
         self.btn_run.pack(pady=5, padx=10)
-
+        
+        # Clear button
         self.btn_clear = ctk.CTkButton(self.left, text="Clear",
                                        font=ctk.CTkFont(family="Arial", size=16, weight="bold"),
                                        command=self.clear, fg_color="#08103b")
         self.btn_clear.pack(pady=5, padx=10)
-
+        
+        # Status label
         self.status = ctk.CTkLabel(self.left, text="Waiting for image",
                                    font=ctk.CTkFont(family="Arial", size=16, weight="bold"),
                                    wraplength=180)
         self.status.pack(pady=10, padx=10)
-
-        self.image_label = ctk.CTkLabel(self.right, text="*Image preview*",
+        
+        # Progress bar for processing
+        self.progress_bar = ctk.CTkProgressBar(self.left, width=150, progress_color="#00ff00")
+        self.progress_bar.pack(pady=5, padx=10, side="right")
+        
+        # Image label (preview)
+        self.image_label = ctk.CTkLabel(self.right, text="Drag & drop image here",
                                         font=ctk.CTkFont(family="Arial", size=16, weight="bold"))
         self.image_label.pack(pady=5)
-
-        self.result_box = ctk.CTkTextbox(self.right, height=200, font=ctk.CTkFont(family="Arial", size=12, weight="bold"), corner_radius=20, fg_color="#21263d")
+        
+        # Result textbox
+        self.result_box = ctk.CTkTextbox(self.right, height=200, font=ctk.CTkFont(family="Arial", size=12, weight="bold"),
+                                         corner_radius=20, fg_color="#21263d")
         self.result_box.pack(fill="both", expand=True, padx=10, pady=10)
-
+        
+        # Image path and OCR initialization
         self.image_path = None
         self.ocr = None
         self._init_ocr()
-
+        
+        # Escape to close
         self.bind('<Escape>', lambda e: self.destroy())
-
+    
+    def close_window(self):
+        """Close the application."""
+        self.destroy()
+    
+    def start_move(self, event):
+        """Record the starting position for window dragging."""
+        self._drag_x = event.x
+        self._drag_y = event.y
+    
+    def do_move(self, event):
+        """Move the window based on mouse movement."""
+        dx = event.x - self._drag_x
+        dy = event.y - self._drag_y
+        x = self.winfo_x() + dx
+        y = self.winfo_y() + dy
+        self.geometry(f"+{x}+{y}")
+    
     def play_animation(self):
-        """Play animation in a separate thread"""
+        """Play animation in a separate thread with progress indication."""
         def animate():
             cap = cv2.VideoCapture(str(self.video_path))
             if not cap.isOpened():
                 self.status.configure(text="Animation load error")
                 return
-
+            
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_delay = 1 / fps if fps > 0 else 0.033
             
@@ -93,7 +139,7 @@ class App(ctk.CTk):
                 if not ret:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-
+                
                 # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
@@ -117,19 +163,21 @@ class App(ctk.CTk):
         if not self.is_animating:
             self.is_animating = True
             self.animation_thread = threading.Thread(target=animate, daemon=True)
+            self.progress_bar.start(10)  # Start indeterminate progress
             self.animation_thread.start()
-
+    
     def stop_animation(self):
-        """Stop animation"""
+        """Stop animation and reset progress bar."""
         self.is_animating = False
         if self.animation_thread:
             self.animation_thread.join(timeout=1)
-
+        self.progress_bar.stop()
+    
     def _init_ocr(self):
         root_dir = os.path.dirname(os.path.abspath(__file__))
         model_path = os.path.join(root_dir, "best.pt")
         config_path = os.path.join(root_dir, "g-vision-config.json")
-
+        
         if os.path.exists(config_path):
             try:
                 with open(config_path, encoding="utf-8") as f:
@@ -141,7 +189,7 @@ class App(ctk.CTk):
                         model_path = candidate
             except Exception as ex:
                 print(f"Failed to load OCR config: {ex}")
-
+        
         if not os.path.exists(model_path):
             fallback_paths = [
                 os.path.join(root_dir, "best_model.pt"),
@@ -154,7 +202,7 @@ class App(ctk.CTk):
                 if os.path.exists(p):
                     model_path = p
                     break
-
+        
         if os.path.exists(model_path):
             from train import GVisionOCR
             try:
@@ -165,7 +213,7 @@ class App(ctk.CTk):
                 self.ocr = None
         else:
             self.status.configure(text="OCR model not found")
-
+    
     def load_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg")])
         if not path:
@@ -175,7 +223,7 @@ class App(ctk.CTk):
         self.image_label.configure(image=img, text="")
         self.image_label.image = img
         self.status.configure(text="Image loaded")
-
+    
     def recognize(self):
         if not self.image_path:
             self.status.configure(text="Load image first")
@@ -184,7 +232,7 @@ class App(ctk.CTk):
         if self.ocr is None:
             self.status.configure(text="OCR model not loaded")
             return
-
+        
         self.status.configure(text="Recognizing...")
         self.play_animation()
         
@@ -202,19 +250,19 @@ class App(ctk.CTk):
             finally:
                 self.stop_animation()
                 self.status.configure(text="Ready")
-
+        
         thread = threading.Thread(target=process, daemon=True)
         thread.start()
-
+    
     def clear(self):
         self.stop_animation()
-        self.image_label.configure(image=None, text="*Image preview*",
+        self.image_label.configure(image=None, text="Drag & drop image here",
                                    font=ctk.CTkFont(family="Arial", size=16, weight="bold"))
         self.result_box.delete("1.0", "end")
         self.image_path = None
         self.status.configure(text="Cleared")
-
-
+    
+    
 if __name__ == "__main__":
     app = App()
     app.mainloop()
