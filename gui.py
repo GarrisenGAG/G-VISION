@@ -1,3 +1,5 @@
+import sys
+import platform
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Tuple
@@ -26,15 +28,19 @@ class App(ctk.CTk):
     RED = "#ef4444"
     TEXT = "#e6eefc"
     SUBTEXT = "#94a3b8"
+    CORNER_RADIUS = 32
 
     def __init__(self) -> None:
         super().__init__()
 
+        self._window_rounded = False
         self.overrideredirect(True)
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(1100, 760)
         self.title("G-Vision")
         self.configure(fg_color=self.BG)
+
+        self._apply_window_rounding()
 
         self._image_path: Optional[Path] = None
         self._preview = None
@@ -44,16 +50,45 @@ class App(ctk.CTk):
         self._processing_dots = 0
         self.executor = ThreadPoolExecutor(max_workers=1)
 
-        # параметры инференса
         self._model_path = Path(__file__).parent / "best.pt"
         self._device = "auto"
         self._use_compile = False
 
-        self._settings_window = None
-
         self._build()
         self._init_ocr()
         self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _apply_window_rounding(self) -> None:
+        system = platform.system()
+        if system == "Darwin":
+            try:
+                import objc
+                from AppKit import NSBezierPath, NSWindow
+                from Cocoa import NSView
+
+                window_id = self.winfo_id()
+                window = NSWindow.windowWithWindowNumber_(window_id)
+                if window:
+                    width = self.winfo_width()
+                    height = self.winfo_height()
+                    radius = self.CORNER_RADIUS
+
+                    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        ((0, 0), (width, height)), radius, radius
+                    )
+                    window.setOpaque_(False)
+                    mask_view = NSView.alloc().initWithFrame_(((0, 0), (width, height)))
+                    path.setClip()
+                    window.setContentMask_(path)
+                    self._window_rounded = True
+            except Exception:
+                pass
+        elif system == "Windows":
+            try:
+                self.wm_attributes("-transparentcolor", self.BG)
+                self.wm_attributes("-disabled", False)
+            except Exception:
+                pass
 
     def _build(self) -> None:
         self.grid_rowconfigure(1, weight=1)
@@ -65,11 +100,11 @@ class App(ctk.CTk):
             self,
             width=360,
             fg_color=self.SIDEBAR,
-            corner_radius=32,
+            corner_radius=self.CORNER_RADIUS,
         )
         self.sidebar.grid(row=1, column=0, sticky="ns", padx=16, pady=16)
 
-        self.content = ctk.CTkFrame(self, fg_color=self.BG, corner_radius=32)
+        self.content = ctk.CTkFrame(self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS)
         self.content.grid(
             row=1,
             column=1,
@@ -84,14 +119,13 @@ class App(ctk.CTk):
         self._build_sidebar()
         self._build_preview()
         self._build_result()
-        self._build_settings_button()
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(
             self,
             fg_color=self.SIDEBAR,
             height=124,
-            corner_radius=28,
+            corner_radius=self.CORNER_RADIUS,
         )
         header.grid(
             row=0,
@@ -148,7 +182,7 @@ class App(ctk.CTk):
             logo_label = ctk.CTkLabel(
                 logo_bg,
                 text="G",
-                font=("Arial", 18, "bold"),
+                font=("Arial Bold", 18),
                 text_color="#ffffff",
             )
             logo_label.place(relx=0.5, rely=0.5, anchor="center")
@@ -158,7 +192,7 @@ class App(ctk.CTk):
         title = ctk.CTkLabel(
             left_frame,
             text="G-Vision",
-            font=("Arial", 18, "bold"),
+            font=("Arial Bold", 24),
             text_color=self.TEXT,
         )
         title.grid(row=0, column=1, sticky="w")
@@ -178,9 +212,10 @@ class App(ctk.CTk):
             progress_container,
             text="Готов",
             text_color=self.SUBTEXT,
-            font=("Arial", 13, "bold"),
+            font=("Arial Bold", 13),
         )
         self.header_status_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.header_status_label.bind("<Button-1>", self._on_model_status_click)
 
         self.close_button = ctk.CTkButton(
             header,
@@ -191,7 +226,7 @@ class App(ctk.CTk):
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
             command=self.close,
-            font=("Arial", 14, "bold"),
+            font=("Arial Bold", 14),
         )
         self.close_button.grid(row=0, column=2, sticky="e", padx=16, pady=12)
 
@@ -205,25 +240,11 @@ class App(ctk.CTk):
         self.btn_clear = self.make_btn("Очистить", self.clear_all, red=True)
         self.btn_clear.pack(fill="x", padx=20, pady=(8, 20))
 
-    def _build_settings_button(self) -> None:
-        self.settings_button = ctk.CTkButton(
-            self.sidebar,
-            text="⚙",
-            width=52,
-            height=52,
-            corner_radius=26,
-            fg_color=self.INPUT,
-            hover_color=self.BTN_HOVER,
-            command=self.open_settings,
-            font=("Arial", 18, "bold"),
-        )
-        self.settings_button.pack(side="bottom", anchor="w", padx=20, pady=20)
-
     def _build_preview(self) -> None:
         self.preview_card = ctk.CTkFrame(
             self.content,
             fg_color=self.PANEL,
-            corner_radius=32,
+            corner_radius=self.CORNER_RADIUS,
         )
         self.preview_card.grid(row=1, column=0, sticky="nsew", pady=(0, 16))
         self.preview_card.grid_rowconfigure(1, weight=1)
@@ -232,7 +253,7 @@ class App(ctk.CTk):
         title = ctk.CTkLabel(
             self.preview_card,
             text="Изображение",
-            font=("Arial", 24, "bold"),
+            font=("Arial Bold", 24),
             text_color=self.TEXT,
         )
         title.pack(anchor="w", padx=24, pady=20)
@@ -240,7 +261,7 @@ class App(ctk.CTk):
         self.preview_container = ctk.CTkFrame(
             self.preview_card,
             fg_color=self.INPUT,
-            corner_radius=32,
+            corner_radius=self.CORNER_RADIUS,
         )
         self.preview_container.pack(expand=True, fill="both", padx=20, pady=(0, 24))
         self.preview_container.grid_rowconfigure(0, weight=1)
@@ -249,7 +270,7 @@ class App(ctk.CTk):
         self.preview_box = ctk.CTkFrame(
             self.preview_container,
             fg_color=self.INPUT,
-            corner_radius=32,
+            corner_radius=self.CORNER_RADIUS,
         )
         self.preview_box.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self.preview_box.grid_rowconfigure(0, weight=1)
@@ -268,7 +289,7 @@ class App(ctk.CTk):
         self.result_card = ctk.CTkFrame(
             self.content,
             fg_color=self.PANEL,
-            corner_radius=32,
+            corner_radius=self.CORNER_RADIUS,
         )
         self.result_card.grid(row=2, column=0, sticky="nsew")
         self.result_card.grid_rowconfigure(1, weight=1)
@@ -277,7 +298,7 @@ class App(ctk.CTk):
         title = ctk.CTkLabel(
             self.result_card,
             text="Распознанный текст",
-            font=("Arial", 24, "bold"),
+            font=("Arial Bold", 24),
             text_color=self.TEXT,
         )
         title.pack(anchor="w", padx=24, pady=20)
@@ -308,7 +329,7 @@ class App(ctk.CTk):
                 self.sidebar,
                 text=text,
                 height=56,
-                font=("Arial", 16, "bold"),
+                font=("Arial Bold", 16),
                 fg_color="#ffffff",
                 text_color=self.BTN,
                 hover_color="#dee8ff",
@@ -322,173 +343,28 @@ class App(ctk.CTk):
             self.sidebar,
             text=text,
             height=56,
-            font=("Arial", 16, "bold"),
+            font=("Arial Bold", 16),
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
             command=cmd,
             corner_radius=28,
         )
 
-    def load_image(self) -> None:
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp")]
-        )
-        if not file_path:
-            return
-
-        self._image_path = Path(file_path)
-        image = Image.open(file_path).convert("RGB")
-        image.thumbnail((900, 650))
-        radius = min(32, min(image.size) // 8)
-        rounded = self._make_rounded_image(image, radius=radius)
-
-        self._preview = ctk.CTkImage(rounded, size=rounded.size)
-        self.preview_label.configure(image=self._preview, text="")
-
-        self.update_status("Изображение загружено", self.TEXT)
-
-    def _init_ocr(self) -> None:
+    def _on_model_status_click(self, event=None):
         if not self._model_path.exists():
-            self.update_status(
-                f"Модель не найдена: {self._model_path.name} — укажите путь в настройках",
-                self.RED,
-            )
-            self._ocr = None
-            return
-
-        try:
-            self._ocr = GVisionOCR(
-                str(self._model_path),
-                device=self._device,
-                use_compile=self._use_compile,
-            )
-            self.update_status(f"Модель загружена: {self._model_path.name}", self.TEXT)
-        except Exception as error:
-            self._ocr = None
-            self.update_status(f"Ошибка загрузки OCR: {error}", self.RED)
-
-    def open_settings(self) -> None:
-        if self._settings_window and self._settings_window.winfo_exists():
-            self._settings_window.lift()
-            return
-
-        self._settings_window = ctk.CTkToplevel(self)
-        self._settings_window.title("Настройки")
-        self._settings_window.geometry("560x380")
-        self._settings_window.configure(fg_color=self.BG)
-        self._settings_window.resizable(False, False)
-
-        header = ctk.CTkLabel(
-            self._settings_window,
-            text="Настройки модели",
-            font=("Arial", 20, "bold"),
-            text_color=self.TEXT,
-        )
-        header.pack(anchor="w", padx=24, pady=(24, 8))
-
-        body = ctk.CTkFrame(
-            self._settings_window,
-            fg_color=self.PANEL,
-            corner_radius=28,
-        )
-        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        body.grid_columnconfigure(0, weight=1)
-
-        self._build_settings_panel(body)
-
-    def _build_settings_panel(self, parent: ctk.CTkFrame) -> None:
-        # блок: путь к модели
-        model_block = ctk.CTkFrame(parent, fg_color=self.INPUT, corner_radius=24)
-        model_block.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
-        model_block.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            model_block,
-            text="Путь к модели (.pt / .pth)",
-            font=("Arial", 14, "bold"),
-            text_color=self.TEXT,
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
-
-        self.model_path_var = ctk.StringVar(value=str(self._model_path))
-        ctk.CTkEntry(
-            model_block,
-            textvariable=self.model_path_var,
-            fg_color=self.BG,
-            corner_radius=16,
-        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
-
-        ctk.CTkButton(
-            model_block,
-            text="Выбрать файл",
-            width=160,
-            height=42,
-            corner_radius=20,
-            fg_color=self.BTN,
-            hover_color=self.BTN_HOVER,
-            command=self.choose_model_file,
-        ).grid(row=2, column=0, sticky="e", padx=16, pady=(0, 16))
-
-        # блок: устройство и компиляция
-        infer_block = ctk.CTkFrame(parent, fg_color=self.INPUT, corner_radius=24)
-        infer_block.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
-        infer_block.grid_columnconfigure(1, weight=1)
-
-        self.device_var = ctk.StringVar(value=self._device)
-        ctk.CTkLabel(
-            infer_block,
-            text="Устройство",
-            font=("Arial", 14, "bold"),
-            text_color=self.TEXT,
-        ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
-        ctk.CTkOptionMenu(
-            infer_block,
-            values=["auto", "cpu", "cuda"],
-            variable=self.device_var,
-            width=180,
-            corner_radius=20,
-        ).grid(row=0, column=1, sticky="e", padx=16, pady=(16, 8))
-
-        self.use_compile_var = ctk.BooleanVar(value=self._use_compile)
-        ctk.CTkCheckBox(
-            infer_block,
-            text="Компиляция модели (torch.compile)",
-            variable=self.use_compile_var,
-            corner_radius=16,
-            fg_color=self.BTN,
-            hover_color=self.BTN_HOVER,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 16))
-
-        # кнопка сохранить
-        ctk.CTkButton(
-            parent,
-            text="Сохранить и перезагрузить модель",
-            width=260,
-            height=48,
-            corner_radius=24,
-            fg_color=self.BTN,
-            hover_color=self.BTN_HOVER,
-            command=self.apply_settings,
-        ).grid(row=2, column=0, sticky="e", padx=16, pady=(8, 16))
+            self.choose_model_file()
 
     def choose_model_file(self) -> None:
         file_path = filedialog.askopenfilename(
             filetypes=[("PyTorch модели", "*.pt *.pth"), ("Все файлы", "*.*")]
         )
         if file_path:
-            self.model_path_var.set(file_path)
-
-    def apply_settings(self) -> None:
-        try:
-            self._model_path = Path(self.model_path_var.get())
-            self._device = self.device_var.get()
-            self._use_compile = self.use_compile_var.get()
+            self._model_path = Path(file_path)
             self._init_ocr()
-        except Exception as error:
-            self.update_status(f"Ошибка настроек: {error}", self.RED)
 
     def recognize(self) -> None:
         if not self._ocr:
-            self.update_status("OCR не загружен — проверьте настройки", self.RED)
+            self.update_status("Модель не загружена - выберите нажав на линию прогресса", self.RED)
             return
         if not self._image_path:
             self.update_status("Сначала загрузите изображение", self.RED)
@@ -545,7 +421,45 @@ class App(ctk.CTk):
         self._preview = None
         self._image_path = None
         self.result.delete("1.0", "end")
-        self.update_status("Готов — загрузите новое изображение", self.GREEN)
+        self.update_status("Жду новое изображение", self.GREEN)
+
+    def load_image(self) -> None:
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp")]
+        )
+        if not file_path:
+            return
+
+        self._image_path = Path(file_path)
+        image = Image.open(file_path).convert("RGB")
+        image.thumbnail((900, 650))
+        radius = min(32, min(image.size) // 8)
+        rounded = self._make_rounded_image(image, radius=radius)
+
+        self._preview = ctk.CTkImage(rounded, size=rounded.size)
+        self.preview_label.configure(image=self._preview, text="")
+
+        self.update_status("Изображение загружено", self.TEXT)
+
+    def _init_ocr(self) -> None:
+        if not self._model_path.exists():
+            self.update_status(
+                f"Модель не найдена: {self._model_path.name} — нажмите сюда и выберите файл модели",
+                self.RED,
+            )
+            self._ocr = None
+            return
+
+        try:
+            self._ocr = GVisionOCR(
+                str(self._model_path),
+                device=self._device,
+                use_compile=self._use_compile,
+            )
+            self.update_status(f"Модель загружена: {self._model_path.name}", self.TEXT)
+        except Exception as error:
+            self._ocr = None
+            self.update_status(f"Ошибка загрузки OCR: {error}", self.RED)
 
     def _make_rounded_image(self, image: Image.Image, radius: int) -> Image.Image:
         image = image.convert("RGBA")
