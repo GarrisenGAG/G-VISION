@@ -671,5 +671,46 @@ class Orchestrator:
         self.logger("=" * 60)
 
 
+class GVisionOCR:
+    def __init__(self, model_path: str, device: str = "auto", use_compile: bool = False):
+        self.encoder = SymbolEncoder()
+        self.params = SessionParameters()
+
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        state = torch.load(model_path, map_location=self.device, weights_only=False)
+        weights = state.get("aligner", state)
+
+        legacy = False
+        use_final_conv = True
+        hidden_size = 320
+        if "rnn.weight_ih_l0" in weights and weights["rnn.weight_ih_l0"].shape[0] == 1024:
+            legacy = True
+        if "classifier.2.weight" in weights and weights["classifier.2.weight"].shape[1] == 512:
+            legacy = True
+        if legacy:
+            hidden_size = 256
+
+        self.aligner = SequenceAligner(
+            self.encoder.size, hidden_size, use_final_conv, legacy
+        ).to(self.device)
+
+        compatible = {
+            k: v for k, v in weights.items()
+            if k in self.aligner.state_dict()
+            and v.shape == self.aligner.state_dict()[k].shape
+        }
+        self.aligner.load_state_dict(compatible, strict=False)
+        self.aligner.eval()
+
+        if use_compile and hasattr(torch, "compile"):
+            try:
+                self.aligner = torch.compile(self.aligner)
+            except Exception:
+                pass
+
 if __name__ == "__main__":
     Orchestrator().execute()
