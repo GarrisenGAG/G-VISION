@@ -3,32 +3,119 @@ import platform
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Tuple
-
+import tkinter as tk
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 from tkinter import filedialog
-
-from train import GVisionOCR
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+from train import GVisionOCR 
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+
+class RoundScrollbar(tk.Canvas):
+    def __init__(self, parent, orient="vertical", command=None,
+                 bg="#14306a", thumb_color="#1e40af", hover_color="#2a50cf", **kwargs):
+        super().__init__(parent, bg=bg, highlightthickness=0, borderwidth=0, **kwargs)
+        self._orient = orient
+        self._command = command
+        self._thumb_color = thumb_color
+        self._hover_color = hover_color
+        self._bg = bg
+        self._pos = (0.0, 1.0)
+        self._dragging = False
+        self._drag_start = None
+
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", lambda e: self._draw(hover=True))
+        self.bind("<Leave>", lambda e: self._draw(hover=False))
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, lo, hi):
+        self._pos = (float(lo), float(hi))
+        self._draw()
+
+    def _draw(self, hover=False):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 2 or h < 2:
+            return
+
+        lo, hi = self._pos
+        color = self._hover_color if hover else self._thumb_color
+
+        if self._orient == "vertical":
+            pad = 2
+            x0, x1 = pad, w - pad
+            y0 = lo * h + pad
+            y1 = hi * h - pad
+        else:
+            pad = 2
+            y0, y1 = pad, h - pad
+            x0 = lo * w + pad
+            x1 = hi * w - pad
+
+        r = (x1 - x0) // 2 if self._orient == "vertical" else (y1 - y0) // 2
+        r = max(r, 4)
+        self.create_rounded_rect(x0, y0, x1, y1, r, fill=color)
+
+    def create_rounded_rect(self, x0, y0, x1, y1, r, **kwargs):
+        self.create_polygon(
+            x0 + r, y0,
+            x1 - r, y0,
+            x1, y0,
+            x1, y0 + r,
+            x1, y1 - r,
+            x1, y1,
+            x1 - r, y1,
+            x0 + r, y1,
+            x0, y1,
+            x0, y1 - r,
+            x0, y0 + r,
+            x0, y0,
+            smooth=True, **kwargs
+        )
+
+    def _on_press(self, event):
+        self._dragging = True
+        self._drag_start = event.y if self._orient == "vertical" else event.x
+
+    def _on_drag(self, event):
+        if not self._dragging or self._drag_start is None:
+            return
+        w = self.winfo_width()
+        h = self.winfo_height()
+        size = h if self._orient == "vertical" else w
+        delta = ((event.y if self._orient == "vertical" else event.x) - self._drag_start) / size
+        self._drag_start = event.y if self._orient == "vertical" else event.x
+        if self._command:
+            self._command("moveto", self._pos[0] + delta)
+
+    def _on_release(self, event):
+        self._dragging = False
 
 
 class App(ctk.CTk):
     WIDTH = 1400
     HEIGHT = 920
 
-    BG = "#020208"
-    SIDEBAR = "#0a1a4b"
-    PANEL = "#0a1a4b"
-    INPUT = "#14306a"
-    BTN = "#1e40af"
-    BTN_HOVER = "#15307f"
-    GREEN = "#22c55e"
-    RED = "#ef4444"
-    TEXT = "#e6eefc"
+    BG = "020208"
+    SIDEBAR = "0a1a4b"
+    PANEL = "0a1a4b"
+    INPUT = "14306a"
+    BTN = "1e40af"
+    BTN_HOVER = "15307f"
+    GREEN = "22c55e"
+    RED = "ef4444"
+    TEXT = "e6eefc"
     SUBTEXT = "#94a3b8"
     CORNER_RADIUS = 32
+    TRANSPARENT = "#010101"
 
     def __init__(self) -> None:
         super().__init__()
@@ -38,7 +125,11 @@ class App(ctk.CTk):
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(1100, 760)
         self.title("G-Vision")
-        self.configure(fg_color=self.BG)
+
+        if platform.system() == "Windows":
+            self.configure(fg_color=self.TRANSPARENT)
+        else:
+            self.configure(fg_color=self.BG)
 
         self._apply_window_rounding()
 
@@ -53,6 +144,8 @@ class App(ctk.CTk):
         self._model_path = Path(__file__).parent / "best.pt"
         self._device = "auto"
         self._use_compile = False
+        self._canvas_image_ref = None
+        self._history_items = []
 
         self._build()
         self._init_ocr()
@@ -72,7 +165,6 @@ class App(ctk.CTk):
                     width = self.winfo_width()
                     height = self.winfo_height()
                     radius = self.CORNER_RADIUS
-
                     path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                         ((0, 0), (width, height)), radius, radius
                     )
@@ -85,12 +177,18 @@ class App(ctk.CTk):
                 pass
         elif system == "Windows":
             try:
-                self.wm_attributes("-transparentcolor", self.BG)
-                self.wm_attributes("-disabled", False)
+                self.wm_attributes("-transparentcolor", self.TRANSPARENT)
             except Exception:
                 pass
 
     def _build(self) -> None:
+        if platform.system() == "Windows":
+            self._bg_frame = ctk.CTkFrame(
+                self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS
+            )
+            self._bg_frame.place(x=0, y=0, relwidth=1, relheight=1)
+            self._bg_frame.lower()
+
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
@@ -101,16 +199,24 @@ class App(ctk.CTk):
             width=360,
             fg_color=self.SIDEBAR,
             corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
         )
-        self.sidebar.grid(row=1, column=0, sticky="ns", padx=16, pady=16)
+        self.sidebar.grid(row=1, column=0, sticky="ns", padx=(16, 8), pady=(0, 16))
 
-        self.content = ctk.CTkFrame(self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS)
+        self.content = ctk.CTkFrame(
+            self,
+            fg_color=self.BG,
+            corner_radius=self.CORNER_RADIUS,
+            #border_width=1,
+            #border_color="#1a3a7a",
+        )
         self.content.grid(
             row=1,
             column=1,
             sticky="nsew",
-            padx=16,
-            pady=16,
+            padx=(8, 16),
+            pady=(0, 16),
         )
         self.content.grid_rowconfigure(1, weight=1)
         self.content.grid_rowconfigure(2, weight=1)
@@ -126,6 +232,8 @@ class App(ctk.CTk):
             fg_color=self.SIDEBAR,
             height=124,
             corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
         )
         header.grid(
             row=0,
@@ -148,22 +256,23 @@ class App(ctk.CTk):
         if logo_path.exists():
             try:
                 logo_img = Image.open(logo_path).convert("RGBA")
-                try:
-                    datas = list(logo_img.getdata())
-                    new_data = []
-                    for item in datas:
-                        r, g, b, a = item
-                        if r >= 240 and g >= 240 and b >= 240:
-                            new_data.append((255, 255, 255, 0))
-                        else:
-                            new_data.append((r, g, b, a))
-                    logo_img.putdata(new_data)
-                except Exception:
-                    pass
-                logo_img.thumbnail((48, 48))
-                self._logo_image = ctk.CTkImage(logo_img, size=(48, 48))
+                scale = 8
+                circle_size = 56 * scale
 
-                logo_label = ctk.CTkLabel(left_frame, image=self._logo_image, text="")
+                logo_img = logo_img.resize((40 * scale, 40 * scale), Image.LANCZOS)
+
+                circle = Image.new("RGBA", (circle_size, circle_size), (0, 0, 0, 0))
+                mask = Image.new("L", (circle_size, circle_size), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, circle_size, circle_size), fill=255)
+                white = Image.new("RGBA", (circle_size, circle_size), (255, 255, 255, 255))
+                circle.paste(white, mask=mask)
+
+                offset = ((circle_size - logo_img.width) // 2, (circle_size - logo_img.height) // 2)
+                circle.paste(logo_img, offset, logo_img)
+                circle = circle.resize((56, 56), Image.LANCZOS)
+
+                self._logo_image = ctk.CTkImage(circle, size=(56, 56))
+                logo_label = ctk.CTkLabel(left_frame, image=self._logo_image, text="", fg_color="transparent")
                 logo_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
                 logo_label.bind("<ButtonPress-1>", self.start_move)
             except Exception:
@@ -217,16 +326,18 @@ class App(ctk.CTk):
         self.header_status_label.place(relx=0.5, rely=0.5, anchor="center")
         self.header_status_label.bind("<Button-1>", self._on_model_status_click)
 
+        close_img = Image.open(Path(__file__).parent / "x.png").convert("RGBA")
+        self._close_image = ctk.CTkImage(close_img, size=(14, 14))
         self.close_button = ctk.CTkButton(
             header,
-            text="✕",
+            image=self._close_image,
+            text="",
             width=44,
-            height=40,
-            corner_radius=24,
+            height=44,
+            corner_radius=22,
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
             command=self.close,
-            font=("Arial Bold", 14),
         )
         self.close_button.grid(row=0, column=2, sticky="e", padx=16, pady=12)
 
@@ -240,11 +351,83 @@ class App(ctk.CTk):
         self.btn_clear = self.make_btn("Очистить", self.clear_all, red=True)
         self.btn_clear.pack(fill="x", padx=20, pady=(8, 20))
 
+        history_title = ctk.CTkLabel(
+            self.sidebar,
+            text="История",
+            font=("Arial Bold", 16),
+            text_color=self.SUBTEXT,
+        )
+        history_title.pack(anchor="w", padx=24, pady=(0, 8))
+
+        history_outer = ctk.CTkFrame(
+            self.sidebar,
+            fg_color=self.INPUT,
+            corner_radius=24,
+            border_width=1,
+            border_color="#1a3a7a",
+        )
+        history_outer.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self._history_canvas = tk.Canvas(
+            history_outer,
+            bg=self.INPUT,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self._history_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+
+        history_scroll = RoundScrollbar(
+            history_outer,
+            orient="vertical",
+            command=self._history_canvas.yview,
+            width=8,
+        )
+        history_scroll.pack(side="right", fill="y", pady=8, padx=(0, 6))
+        self._history_canvas.configure(yscrollcommand=history_scroll.set)
+
+        self._history_frame = tk.Frame(self._history_canvas, bg=self.INPUT)
+        self._history_canvas_window = self._history_canvas.create_window(
+            (0, 0), window=self._history_frame, anchor="nw"
+        )
+
+        self._history_frame.bind("<Configure>", self._on_history_resize)
+        self._history_canvas.bind("<Configure>", self._on_history_canvas_resize)
+        self._history_canvas.bind("<MouseWheel>", lambda e: self._history_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    def _draw_canvas_corners(self, canvas, bg_color, radius=24):
+        def redraw(event=None):
+            canvas.delete("corners")
+            w = canvas.winfo_width()
+            h = canvas.winfo_height()
+            if w < 2 or h < 2:
+                return
+            r = radius
+            for x, y, ax, ay in [
+                (0, 0, 0, 0),
+                (w, 0, 1, 0),
+                (0, h, 0, 1),
+                (w, h, 1, 1),
+            ]:
+                canvas.create_arc(
+                    x - r * (1 - 2*ax), y - r * (1 - 2*ay),
+                    x + r * (2*ax - 0) if ax == 0 else x - r,
+                    y + r if ay == 0 else y - r,
+                    start=[180, 270, 90, 0][int(ax*2 + ay)],
+                    extent=90,
+                    fill=bg_color,
+                    outline=bg_color,
+                    tags="corners",
+                )
+        canvas.bind("<Configure>", lambda e: redraw())
+        redraw()
+
     def _build_preview(self) -> None:
         self.preview_card = ctk.CTkFrame(
             self.content,
             fg_color=self.PANEL,
             corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
         )
         self.preview_card.grid(row=1, column=0, sticky="nsew", pady=(0, 16))
         self.preview_card.grid_rowconfigure(1, weight=1)
@@ -258,38 +441,44 @@ class App(ctk.CTk):
         )
         title.pack(anchor="w", padx=24, pady=20)
 
-        self.preview_container = ctk.CTkFrame(
+        outer = ctk.CTkFrame(
             self.preview_card,
             fg_color=self.INPUT,
             corner_radius=self.CORNER_RADIUS,
         )
-        self.preview_container.pack(expand=True, fill="both", padx=20, pady=(0, 24))
-        self.preview_container.grid_rowconfigure(0, weight=1)
-        self.preview_container.grid_columnconfigure(0, weight=1)
+        outer.pack(expand=True, fill="both", padx=20, pady=(0, 24))
 
-        self.preview_box = ctk.CTkFrame(
-            self.preview_container,
-            fg_color=self.INPUT,
-            corner_radius=self.CORNER_RADIUS,
+        self.preview_canvas = tk.Canvas(
+            outer,
+            bg=self.INPUT,
+            highlightthickness=0,
+            borderwidth=0,
         )
-        self.preview_box.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
-        self.preview_box.grid_rowconfigure(0, weight=1)
-        self.preview_box.grid_columnconfigure(0, weight=1)
 
-        self.preview_label = ctk.CTkLabel(
-            self.preview_box,
-            text="",
-            fg_color=self.INPUT,
-            corner_radius=0,
-            anchor="center",
+        v_scroll = RoundScrollbar(outer, orient="vertical",
+            command=self.preview_canvas.yview, width=8)
+        h_scroll = RoundScrollbar(outer, orient="horizontal",
+            command=self.preview_canvas.xview, height=8)
+
+        self.preview_canvas.configure(
+            yscrollcommand=v_scroll.set,
+            xscrollcommand=h_scroll.set,
         )
-        self.preview_label.grid(row=0, column=0, sticky="nsew")
+
+        h_scroll.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
+        v_scroll.pack(side="right", fill="y", pady=16, padx=(0, 8))
+        self.preview_canvas.pack(expand=True, fill="both", padx=(16, 0), pady=16)
+        self._draw_canvas_corners(self.preview_canvas, self.INPUT)
+        self.preview_canvas.bind("<MouseWheel>", lambda e: self.preview_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        self.preview_canvas.bind("<Shift-MouseWheel>", lambda e: self.preview_canvas.xview_scroll(-1 * (e.delta // 120), "units"))
 
     def _build_result(self) -> None:
         self.result_card = ctk.CTkFrame(
             self.content,
             fg_color=self.PANEL,
             corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
         )
         self.result_card.grid(row=2, column=0, sticky="nsew")
         self.result_card.grid_rowconfigure(1, weight=1)
@@ -308,6 +497,8 @@ class App(ctk.CTk):
             fg_color=self.INPUT,
             font=("Arial", 16),
             corner_radius=28,
+            border_width=1,
+            border_color="#1a3a7a",
         )
         self.result.pack(expand=True, fill="both", padx=20)
 
@@ -403,10 +594,87 @@ class App(ctk.CTk):
         self._processing_animation_active = False
         self.update_status("Распознавание завершено", self.GREEN)
 
+    def _on_history_resize(self, event):
+        self._history_canvas.configure(scrollregion=self._history_canvas.bbox("all"))
+
+    def _on_history_canvas_resize(self, event):
+        self._history_canvas.itemconfig(self._history_canvas_window, width=event.width)
+
+    def _add_history_item(self, text: str) -> None:
+        preview = text.strip()[:60].replace("\n", " ")
+        if len(text.strip()) > 60:
+            preview += "..."
+
+        item_frame = tk.Frame(self._history_frame, bg=self.INPUT)
+        item_frame.pack(fill="x", padx=4, pady=4)
+
+        item_canvas = tk.Canvas(
+            item_frame,
+            bg=self.INPUT,
+            highlightthickness=0,
+            borderwidth=0,
+            height=64,
+        )
+        item_canvas.pack(fill="x")
+
+        def draw_item(event, canvas=item_canvas, t=preview):
+            w = canvas.winfo_width()
+            canvas.delete("all")
+            r = 16
+            canvas.create_polygon(
+                r, 0, w-r, 0, w, 0, w, r,
+                w, 64-r, w, 64, w-r, 64,
+                r, 64, 0, 64, 0, 64-r,
+                0, r, 0, 0,
+                smooth=True, fill="#1e3a6e",
+            )
+            canvas.create_text(12, 32, text=t, fill=self.TEXT,
+                font=("Arial", 11), anchor="w", width=w-24)
+
+        def on_click(event, full=text):
+            self._show_result(full)
+
+        def on_enter(event, canvas=item_canvas, t=preview):
+            w = canvas.winfo_width()
+            canvas.delete("all")
+            r = 16
+            canvas.create_polygon(
+                r, 0, w-r, 0, w, 0, w, r,
+                w, 64-r, w, 64, w-r, 64,
+                r, 64, 0, 64, 0, 64-r,
+                0, r, 0, 0,
+                smooth=True, fill="#2a50cf",
+            )
+            canvas.create_text(12, 32, text=t, fill="#ffffff",
+                font=("Arial", 11), anchor="w", width=w-24)
+
+        def on_leave(event, canvas=item_canvas, t=preview):
+            w = canvas.winfo_width()
+            canvas.delete("all")
+            r = 16
+            canvas.create_polygon(
+                r, 0, w-r, 0, w, 0, w, r,
+                w, 64-r, w, 64, w-r, 64,
+                r, 64, 0, 64, 0, 64-r,
+                0, r, 0, 0,
+                smooth=True, fill="#1e3a6e",
+            )
+            canvas.create_text(12, 32, text=t, fill=self.TEXT,
+                font=("Arial", 11), anchor="w", width=w-24)
+
+        item_canvas.bind("<Configure>", draw_item)
+        item_canvas.bind("<Button-1>", on_click)
+        item_canvas.bind("<Enter>", on_enter)
+        item_canvas.bind("<Leave>", on_leave)
+
+        self._history_items.append(item_frame)
+        self._history_canvas.yview_moveto(1.0)
+
     def _show_result(self, text: str) -> None:
         self.result.delete("1.0", "end")
         self.result.insert("1.0", text)
         self.update_status("Текст успешно распознан", self.GREEN)
+        self._add_history_item(text)
 
     def copy_text(self) -> None:
         text = self.result.get("1.0", "end").strip()
@@ -417,8 +685,8 @@ class App(ctk.CTk):
         self.update_status("Текст скопирован в буфер", self.GREEN)
 
     def clear_all(self) -> None:
-        self.preview_label.configure(image=None)
-        self._preview = None
+        self.preview_canvas.delete("all")
+        self._canvas_image_ref = None
         self._image_path = None
         self.result.delete("1.0", "end")
         self.update_status("Жду новое изображение", self.GREEN)
@@ -432,12 +700,14 @@ class App(ctk.CTk):
 
         self._image_path = Path(file_path)
         image = Image.open(file_path).convert("RGB")
-        image.thumbnail((900, 650))
+
         radius = min(32, min(image.size) // 8)
         rounded = self._make_rounded_image(image, radius=radius)
 
-        self._preview = ctk.CTkImage(rounded, size=rounded.size)
-        self.preview_label.configure(image=self._preview, text="")
+        self._canvas_image_ref = ImageTk.PhotoImage(rounded)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(0, 0, image=self._canvas_image_ref, anchor="nw")
+        self.preview_canvas.configure(scrollregion=(0, 0, rounded.width, rounded.height))
 
         self.update_status("Изображение загружено", self.TEXT)
 
