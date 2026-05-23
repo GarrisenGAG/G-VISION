@@ -9,7 +9,6 @@ from PIL import Image, ImageDraw, ImageTk
 from tkinter import filedialog
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-from train import GVisionOCR 
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -104,15 +103,15 @@ class App(ctk.CTk):
     WIDTH = 1400
     HEIGHT = 920
 
-    BG = "020208"
-    SIDEBAR = "0a1a4b"
-    PANEL = "0a1a4b"
-    INPUT = "14306a"
-    BTN = "1e40af"
-    BTN_HOVER = "15307f"
-    GREEN = "22c55e"
-    RED = "ef4444"
-    TEXT = "e6eefc"
+    BG = "#020208"
+    SIDEBAR = "#0a1a4b"
+    PANEL = "#0a1a4b"
+    INPUT = "#14306a"
+    BTN = "#1e40af"
+    BTN_HOVER = "#15307f"
+    GREEN = "#22c55e"
+    RED = "#ef4444"
+    TEXT = "#e6eefc"
     SUBTEXT = "#94a3b8"
     CORNER_RADIUS = 32
     TRANSPARENT = "#010101"
@@ -402,6 +401,7 @@ class App(ctk.CTk):
             if w < 2 or h < 2:
                 return
             r = radius
+
             for x, y, ax, ay in [
                 (0, 0, 0, 0),
                 (w, 0, 1, 0),
