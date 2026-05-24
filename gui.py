@@ -1,4 +1,5 @@
 import sys
+import math
 import platform
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -138,6 +139,7 @@ class App(ctk.CTk):
         self._drag_position: Optional[Tuple[int, int]] = None
         self._processing_animation_active = False
         self._processing_dots = 0
+        self._glow_phase = 0.0
         self.executor = ThreadPoolExecutor(max_workers=1)
 
         self._model_path = Path(__file__).parent / "best.pt"
@@ -183,7 +185,8 @@ class App(ctk.CTk):
     def _build(self) -> None:
         if platform.system() == "Windows":
             self._bg_frame = ctk.CTkFrame(
-                self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS
+                self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS,
+                border_width=2, border_color="#081327",
             )
             self._bg_frame.place(x=0, y=0, relwidth=1, relheight=1)
             self._bg_frame.lower()
@@ -200,6 +203,7 @@ class App(ctk.CTk):
             corner_radius=self.CORNER_RADIUS,
             border_width=1,
             border_color="#1a3a7a",
+            bg_color=self.BG,
         )
         self.sidebar.grid(row=1, column=0, sticky="ns", padx=(16, 8), pady=(0, 16))
 
@@ -207,6 +211,7 @@ class App(ctk.CTk):
             self,
             fg_color=self.BG,
             corner_radius=self.CORNER_RADIUS,
+            bg_color=self.BG,
             #border_width=1,
             #border_color="#1a3a7a",
         )
@@ -233,6 +238,7 @@ class App(ctk.CTk):
             corner_radius=self.CORNER_RADIUS,
             border_width=1,
             border_color="#1a3a7a",
+            bg_color=self.BG,
         )
         header.grid(
             row=0,
@@ -307,11 +313,14 @@ class App(ctk.CTk):
         title.bind("<ButtonPress-1>", self.start_move)
         title.bind("<B1-Motion>", self.move_window)
 
-        progress_container = ctk.CTkFrame(
+        self.progress_container = ctk.CTkFrame(
             header,
             fg_color=self.BTN,
             corner_radius=26,
+            border_width=1,
+            border_color="#2a52c0",
         )
+        progress_container = self.progress_container
         progress_container.grid(row=0, column=1, sticky="ew", padx=8, pady=12)
         progress_container.grid_propagate(False)
         progress_container.configure(height=42)
@@ -336,6 +345,8 @@ class App(ctk.CTk):
             corner_radius=22,
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
+            border_width=1,
+            border_color="#2a52c0",
             command=self.close,
         )
         self.close_button.grid(row=0, column=2, sticky="e", padx=16, pady=12)
@@ -507,6 +518,8 @@ class App(ctk.CTk):
             text="Копировать текст",
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
+            border_width=1,
+            border_color="#2a52c0",
             command=self.copy_text,
             width=220,
             height=48,
@@ -537,6 +550,8 @@ class App(ctk.CTk):
             font=("Arial Bold", 16),
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
+            border_width=1,
+            border_color="#2a52c0",
             command=cmd,
             corner_radius=28,
         )
@@ -563,8 +578,10 @@ class App(ctk.CTk):
 
         self._processing_animation_active = True
         self._processing_dots = 0
+        self._glow_phase = 0.0
         self.update_status("Разглядываю изображение...", self.TEXT)
         self._animate_processing()
+        self._animate_progress_glow()
         self.executor.submit(self._worker)
 
     def _worker(self) -> None:
@@ -593,6 +610,31 @@ class App(ctk.CTk):
     def _finish_processing(self) -> None:
         self._processing_animation_active = False
         self.update_status("Распознавание завершено", self.GREEN)
+
+    def _lerp_color(self, c1: str, c2: str, t: float) -> str:
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _animate_progress_glow(self) -> None:
+        if not self._processing_animation_active:
+            try:
+                self.progress_container.configure(fg_color=self.BTN, border_color="#2a52c0")
+            except Exception:
+                pass
+            return
+        t = (math.sin(self._glow_phase) + 1) / 2
+        self._glow_phase = (self._glow_phase + 0.12) % (2 * math.pi)
+        color = self._lerp_color(self.BTN, "#3060e0", t)
+        border = self._lerp_color("#2a52c0", "#4a7aff", t)
+        try:
+            self.progress_container.configure(fg_color=color, border_color=border)
+        except Exception:
+            pass
+        self.after(40, self._animate_progress_glow)
 
     def _on_history_resize(self, event):
         self._history_canvas.configure(scrollregion=self._history_canvas.bbox("all"))
