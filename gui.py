@@ -1,32 +1,280 @@
-import sys
 import math
 import platform
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import Optional, Tuple
-import tkinter as tk
-import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageTk
-from tkinter import filedialog
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from tkinter import filedialog
+from typing import Dict, List, Optional, Tuple
+import tkinter as tk
+
+
+import customtkinter as ctk
+import torch
+import torch.nn as nn
+from PIL import Image, ImageDraw, ImageTk
+from torchvision import transforms
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+@dataclass
+class InferenceConfig:
+
+    img_height: int = 64
+    max_width: int = 1024
+
+
+class SymbolEncoder:
+
+    VOCABULARY: List[str] = (
+        ["<blank>", " "]
+        + list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+        + list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
+        + list("0123456789")
+        + list(".,!?;:-—()[]«»\"'/@#№$%&*+=<>~^_{}|\\")
+    )
+
+    def __init__(self) -> None:
+        self._char_to_idx: Dict[str, int] = {
+            ch: i for i, ch in enumerate(self.VOCABULARY)
+        }
+        self._idx_to_char: Dict[int, str] = {
+            i: ch for ch, i in self._char_to_idx.items()
+        }
+        self.size: int = len(self.VOCABULARY)
+
+    def encode(self, text: str) -> List[int]:
+        return [self._char_to_idx.get(ch, 0) for ch in text]
+
+    def decode(
+        self,
+        indices: List[int],
+        merge_repeats: bool = True,
+        skip_blank: bool = True,
+    ) -> str:
+        output: List[str] = []
+        prev = -1
+        for idx in indices:
+            if merge_repeats and idx == prev:
+                continue
+            if skip_blank and idx == 0:
+                prev = idx
+                continue
+            output.append(self._idx_to_char.get(idx, ""))
+            prev = idx
+        return "".join(output)
+
+
+class SpatialLayer(nn.Module):
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel: int = 3,
+        padding: int = 1,
+        pool: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        super().__init__()
+        layers: List[nn.Module] = [
+            nn.Conv2d(
+                in_channels, out_channels, kernel,
+                padding=padding, bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+        if pool:
+            layers.append(nn.MaxPool2d(pool))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class ResidualUnit(nn.Module):
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.body(x))
+
+
+class SequenceAligner(nn.Module):
+
+    def __init__(
+        self,
+        output_dim: int,
+        hidden_size: int = 320,
+        use_final_conv: bool = True,
+        legacy: bool = False,
+    ) -> None:
+        super().__init__()
+
+        cnn_layers: List[nn.Module] = [
+            SpatialLayer(1, 64, pool=(2, 2)),
+            ResidualUnit(64),
+            SpatialLayer(64, 128, pool=(2, 2)),
+            ResidualUnit(128),
+            SpatialLayer(128, 256, pool=(2, 1)),
+            ResidualUnit(256),
+            SpatialLayer(256, 512, pool=(2, 1)),
+        ]
+        if legacy:
+            cnn_layers.append(SpatialLayer(512, 512, kernel=2, padding=0))
+        else:
+            cnn_layers.append(ResidualUnit(512))
+            if use_final_conv:
+                cnn_layers.append(SpatialLayer(512, 512, kernel=2, padding=0))
+
+        self.extractor = nn.Sequential(*cnn_layers)
+        self.pool = nn.AdaptiveAvgPool2d((1, None))
+        self.recurrence = nn.LSTM(
+            512,
+            hidden_size,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=0.5,
+        )
+        self.projection = nn.Sequential(
+            nn.LayerNorm(hidden_size * 2),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_size * 2, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.extractor(x)
+        x = self.pool(x)
+        x = x.squeeze(2).permute(0, 2, 1)
+        x, _ = self.recurrence(x)
+        x = self.projection(x)
+        return x.permute(1, 0, 2).log_softmax(2)
+
+
+_LEGACY_KEY_MAP: Dict[str, str] = {
+    "cnn.": "extractor.",
+    "rnn.": "recurrence.",
+    "classifier.": "projection.",
+}
+
+
+class GVisionOCR:
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "auto",
+        use_compile: bool = False,
+    ) -> None:
+        self._config = InferenceConfig()
+        self._encoder = SymbolEncoder()
+
+        self._device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "auto"
+            else device
+        )
+
+        state = torch.load(
+            model_path, map_location=self._device, weights_only=False
+        )
+        weights: Dict = state.get("aligner", state)
+        weights = {self._remap_key(k): v for k, v in weights.items()}
+
+        legacy = (
+            "recurrence.weight_ih_l0" in weights
+            and weights["recurrence.weight_ih_l0"].shape[0] == 1024
+        )
+        hidden_size = 256 if legacy else 320
+
+        self._model = SequenceAligner(
+            self._encoder.size,
+            hidden_size,
+            use_final_conv=True,
+            legacy=legacy,
+        ).to(self._device)
+
+        model_state = self._model.state_dict()
+        compatible = {
+            k: v
+            for k, v in weights.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        self._model.load_state_dict(compatible, strict=False)
+        self._model.eval()
+
+        if use_compile and hasattr(torch, "compile"):
+            try:
+                self._model = torch.compile(self._model)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _remap_key(key: str) -> str:
+        for old, new in _LEGACY_KEY_MAP.items():
+            if key.startswith(old):
+                return new + key[len(old):]
+        return key
+
+    def recognize(self, image_path: str) -> Dict[str, str]:
+        img = Image.open(image_path).convert("L")
+        width, height = img.size
+        target_h = self._config.img_height
+
+        if height != target_h:
+            new_w = max(32, int(round(width * target_h / height)))
+            img = img.resize((new_w, target_h), Image.Resampling.LANCZOS)
+        if img.width > self._config.max_width:
+            img = img.resize(
+                (self._config.max_width, target_h), Image.Resampling.LANCZOS
+            )
+
+        tensor = transforms.ToTensor()(img)
+        tensor = (1.0 - tensor).unsqueeze(0).to(self._device)
+
+        with torch.no_grad():
+            logits = self._model(tensor)
+
+        seq = logits.argmax(2).cpu().numpy().T[0]
+        return {"text": self._encoder.decode(seq.tolist())}
+
+
 class RoundScrollbar(tk.Canvas):
-    def __init__(self, parent, orient="vertical", command=None,
-                 bg="#14306a", thumb_color="#1e40af", hover_color="#2a50cf", **kwargs):
-        super().__init__(parent, bg=bg, highlightthickness=0, borderwidth=0, **kwargs)
+
+    def __init__(
+        self,
+        parent,
+        orient: str = "vertical",
+        command=None,
+        bg: str = "#14306a",
+        thumb_color: str = "#1e40af",
+        hover_color: str = "#2a50cf",
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            parent, bg=bg, highlightthickness=0, borderwidth=0, **kwargs
+        )
         self._orient = orient
         self._command = command
         self._thumb_color = thumb_color
         self._hover_color = hover_color
-        self._bg = bg
-        self._pos = (0.0, 1.0)
+        self._pos: Tuple[float, float] = (0.0, 1.0)
         self._dragging = False
-        self._drag_start = None
+        self._drag_start: Optional[int] = None
 
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
@@ -35,11 +283,11 @@ class RoundScrollbar(tk.Canvas):
         self.bind("<Leave>", lambda e: self._draw(hover=False))
         self.bind("<Configure>", lambda e: self._draw())
 
-    def set(self, lo, hi):
+    def set(self, lo: str, hi: str) -> None:
         self._pos = (float(lo), float(hi))
         self._draw()
 
-    def _draw(self, hover=False):
+    def _draw(self, hover: bool = False) -> None:
         self.delete("all")
         w = self.winfo_width()
         h = self.winfo_height()
@@ -54,17 +302,25 @@ class RoundScrollbar(tk.Canvas):
             x0, x1 = pad, w - pad
             y0 = lo * h + pad
             y1 = hi * h - pad
+            r = max((x1 - x0) // 2, 4)
         else:
             pad = 2
             y0, y1 = pad, h - pad
             x0 = lo * w + pad
             x1 = hi * w - pad
+            r = max((y1 - y0) // 2, 4)
 
-        r = (x1 - x0) // 2 if self._orient == "vertical" else (y1 - y0) // 2
-        r = max(r, 4)
-        self.create_rounded_rect(x0, y0, x1, y1, r, fill=color)
+        self._draw_rounded_rect(x0, y0, x1, y1, r, fill=color)
 
-    def create_rounded_rect(self, x0, y0, x1, y1, r, **kwargs):
+    def _draw_rounded_rect(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        r: float,
+        **kwargs,
+    ) -> None:
         self.create_polygon(
             x0 + r, y0,
             x1 - r, y0,
@@ -78,49 +334,56 @@ class RoundScrollbar(tk.Canvas):
             x0, y1 - r,
             x0, y0 + r,
             x0, y0,
-            smooth=True, **kwargs
+            smooth=True,
+            **kwargs,
         )
 
-    def _on_press(self, event):
+    def _on_press(self, event) -> None:
         self._dragging = True
-        self._drag_start = event.y if self._orient == "vertical" else event.x
+        self._drag_start = (
+            event.y if self._orient == "vertical" else event.x
+        )
 
-    def _on_drag(self, event):
+    def _on_drag(self, event) -> None:
         if not self._dragging or self._drag_start is None:
             return
         w = self.winfo_width()
         h = self.winfo_height()
         size = h if self._orient == "vertical" else w
-        delta = ((event.y if self._orient == "vertical" else event.x) - self._drag_start) / size
-        self._drag_start = event.y if self._orient == "vertical" else event.x
+        pos = event.y if self._orient == "vertical" else event.x
+        delta = (pos - self._drag_start) / size
+        self._drag_start = pos
         if self._command:
             self._command("moveto", self._pos[0] + delta)
 
-    def _on_release(self, event):
+    def _on_release(self, event) -> None:
         self._dragging = False
 
 
 class App(ctk.CTk):
-    WIDTH = 1400
-    HEIGHT = 920
 
-    BG = "#020208"
-    SIDEBAR = "#0a1a4b"
-    PANEL = "#0a1a4b"
-    INPUT = "#14306a"
-    BTN = "#1e40af"
-    BTN_HOVER = "#15307f"
-    GREEN = "#22c55e"
-    RED = "#ef4444"
-    TEXT = "#e6eefc"
-    SUBTEXT = "#94a3b8"
-    CORNER_RADIUS = 32
-    TRANSPARENT = "#010101"
+    WIDTH: int = 1400
+    HEIGHT: int = 920
+
+
+    BG: str = "#020208"
+    SIDEBAR: str = "#0a1a4b"
+    PANEL: str = "#0a1a4b"
+    INPUT: str = "#14306a"
+    BTN: str = "#1e40af"
+    BTN_HOVER: str = "#15307f"
+    BTN_BORDER: str = "#2a52c0"
+    GREEN: str = "#22c55e"
+    RED: str = "#ef4444"
+    TEXT: str = "#e6eefc"
+    SUBTEXT: str = "#94a3b8"
+    CORNER_RADIUS: int = 32
+    TRANSPARENT: str = "#010101"
 
     def __init__(self) -> None:
         super().__init__()
 
-        self._window_rounded = False
+        self._window_rounded: bool = False
         self.overrideredirect(True)
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(1100, 760)
@@ -134,59 +397,64 @@ class App(ctk.CTk):
         self._apply_window_rounding()
 
         self._image_path: Optional[Path] = None
-        self._preview = None
-        self._ocr = None
+        self._ocr: Optional[GVisionOCR] = None
         self._drag_position: Optional[Tuple[int, int]] = None
-        self._processing_animation_active = False
-        self._processing_dots = 0
-        self._glow_phase = 0.0
-        self.executor = ThreadPoolExecutor(max_workers=1)
-
-        self._model_path = Path(__file__).parent / "best.pt"
-        self._device = "auto"
-        self._use_compile = False
+        self._processing_animation_active: bool = False
+        self._processing_dots: int = 0
+        self._glow_phase: float = 0.0
         self._canvas_image_ref = None
-        self._history_items = []
+        self._history_items: list = []
+
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self._model_path: Path = Path(__file__).parent / "G-Vision 13m.pt"
+        self._device: str = "auto"
+        self._use_compile: bool = False
 
         self._build()
         self._init_ocr()
         self.protocol("WM_DELETE_WINDOW", self.close)
 
+
     def _apply_window_rounding(self) -> None:
         system = platform.system()
-        if system == "Darwin":
-            try:
-                import objc
-                from AppKit import NSBezierPath, NSWindow
-                from Cocoa import NSView
+        if system == "Windows":
 
-                window_id = self.winfo_id()
-                window = NSWindow.windowWithWindowNumber_(window_id)
-                if window:
-                    width = self.winfo_width()
-                    height = self.winfo_height()
-                    radius = self.CORNER_RADIUS
-                    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                        ((0, 0), (width, height)), radius, radius
-                    )
-                    window.setOpaque_(False)
-                    mask_view = NSView.alloc().initWithFrame_(((0, 0), (width, height)))
-                    path.setClip()
-                    window.setContentMask_(path)
-                    self._window_rounded = True
-            except Exception:
-                pass
-        elif system == "Windows":
             try:
                 self.wm_attributes("-transparentcolor", self.TRANSPARENT)
+                self._window_rounded = True
+            except Exception:
+                pass
+        elif system == "Darwin":
+
+            try:
+                self.wm_attributes("-transparent", True)
+                self._window_rounded = True
             except Exception:
                 pass
 
+
     def _build(self) -> None:
-        if platform.system() == "Windows":
+        system = platform.system()
+        if system == "Windows":
+
             self._bg_frame = ctk.CTkFrame(
-                self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS,
-                border_width=2, border_color="#081327",
+                self,
+                fg_color=self.BG,
+                corner_radius=self.CORNER_RADIUS,
+                border_width=2,
+                border_color="#081327",
+            )
+            self._bg_frame.place(x=0, y=0, relwidth=1, relheight=1)
+            self._bg_frame.lower()
+        elif system == "Darwin":
+
+            self._bg_frame = ctk.CTkFrame(
+                self,
+                fg_color=self.BG,
+                corner_radius=self.CORNER_RADIUS,
+                border_width=2,
+                border_color="#081327",
+                bg_color="systemTransparent",
             )
             self._bg_frame.place(x=0, y=0, relwidth=1, relheight=1)
             self._bg_frame.lower()
@@ -205,22 +473,18 @@ class App(ctk.CTk):
             border_color="#1a3a7a",
             bg_color=self.BG,
         )
-        self.sidebar.grid(row=1, column=0, sticky="ns", padx=(16, 8), pady=(0, 16))
+        self.sidebar.grid(
+            row=1, column=0, sticky="ns", padx=(16, 8), pady=(0, 16)
+        )
 
         self.content = ctk.CTkFrame(
             self,
             fg_color=self.BG,
             corner_radius=self.CORNER_RADIUS,
             bg_color=self.BG,
-            #border_width=1,
-            #border_color="#1a3a7a",
         )
         self.content.grid(
-            row=1,
-            column=1,
-            sticky="nsew",
-            padx=(8, 16),
-            pady=(0, 16),
+            row=1, column=1, sticky="nsew", padx=(8, 16), pady=(0, 16)
         )
         self.content.grid_rowconfigure(1, weight=1)
         self.content.grid_rowconfigure(2, weight=1)
@@ -241,67 +505,19 @@ class App(ctk.CTk):
             bg_color=self.BG,
         )
         header.grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            padx=16,
-            pady=(12, 12),
+            row=0, column=0, columnspan=2,
+            sticky="ew", padx=16, pady=(12, 12),
         )
         header.grid_columnconfigure(0, weight=0)
         header.grid_columnconfigure(1, weight=1)
         header.grid_columnconfigure(2, weight=0)
 
-        logo_path = Path(__file__).parent / "logo.png"
         left_frame = ctk.CTkFrame(header, fg_color=self.SIDEBAR, corner_radius=0)
         left_frame.grid(row=0, column=0, sticky="w", padx=(18, 8), pady=12)
         left_frame.grid_columnconfigure(0, weight=0)
         left_frame.grid_columnconfigure(1, weight=0)
 
-        if logo_path.exists():
-            try:
-                logo_img = Image.open(logo_path).convert("RGBA")
-                scale = 8
-                circle_size = 56 * scale
-
-                logo_img = logo_img.resize((40 * scale, 40 * scale), Image.LANCZOS)
-
-                circle = Image.new("RGBA", (circle_size, circle_size), (0, 0, 0, 0))
-                mask = Image.new("L", (circle_size, circle_size), 0)
-                ImageDraw.Draw(mask).ellipse((0, 0, circle_size, circle_size), fill=255)
-                white = Image.new("RGBA", (circle_size, circle_size), (255, 255, 255, 255))
-                circle.paste(white, mask=mask)
-
-                offset = ((circle_size - logo_img.width) // 2, (circle_size - logo_img.height) // 2)
-                circle.paste(logo_img, offset, logo_img)
-                circle = circle.resize((56, 56), Image.LANCZOS)
-
-                self._logo_image = ctk.CTkImage(circle, size=(56, 56))
-                logo_label = ctk.CTkLabel(left_frame, image=self._logo_image, text="", fg_color="transparent")
-                logo_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
-                logo_label.bind("<ButtonPress-1>", self.start_move)
-            except Exception:
-                pass
-        else:
-            logo_bg = ctk.CTkFrame(
-                left_frame,
-                width=48,
-                height=48,
-                fg_color=self.BTN,
-                corner_radius=28,
-            )
-            logo_bg.grid(row=0, column=0, sticky="w", padx=(0, 8))
-            logo_bg.grid_propagate(False)
-
-            logo_label = ctk.CTkLabel(
-                logo_bg,
-                text="G",
-                font=("Arial Bold", 18),
-                text_color="#ffffff",
-            )
-            logo_label.place(relx=0.5, rely=0.5, anchor="center")
-            logo_bg.bind("<ButtonPress-1>", self.start_move)
-            logo_label.bind("<ButtonPress-1>", self.start_move)
+        self._build_logo(left_frame)
 
         title = ctk.CTkLabel(
             left_frame,
@@ -318,15 +534,16 @@ class App(ctk.CTk):
             fg_color=self.BTN,
             corner_radius=26,
             border_width=1,
-            border_color="#2a52c0",
+            border_color=self.BTN_BORDER,
         )
-        progress_container = self.progress_container
-        progress_container.grid(row=0, column=1, sticky="ew", padx=8, pady=12)
-        progress_container.grid_propagate(False)
-        progress_container.configure(height=42)
+        self.progress_container.grid(
+            row=0, column=1, sticky="ew", padx=8, pady=12
+        )
+        self.progress_container.grid_propagate(False)
+        self.progress_container.configure(height=42)
 
         self.header_status_label = ctk.CTkLabel(
-            progress_container,
+            self.progress_container,
             text="Готов",
             text_color=self.SUBTEXT,
             font=("Arial Bold", 13),
@@ -346,28 +563,81 @@ class App(ctk.CTk):
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
             border_width=1,
-            border_color="#2a52c0",
+            border_color=self.BTN_BORDER,
             command=self.close,
         )
         self.close_button.grid(row=0, column=2, sticky="e", padx=16, pady=12)
 
+    def _build_logo(self, parent: ctk.CTkFrame) -> None:
+        logo_path = Path(__file__).parent / "logo.png"
+        if logo_path.exists():
+            try:
+                scale = 8
+                circle_size = 56 * scale
+                logo_img = Image.open(logo_path).convert("RGBA")
+                logo_img = logo_img.resize(
+                    (40 * scale, 40 * scale), Image.LANCZOS
+                )
+                circle = Image.new("RGBA", (circle_size, circle_size), (0, 0, 0, 0))
+                mask = Image.new("L", (circle_size, circle_size), 0)
+                ImageDraw.Draw(mask).ellipse(
+                    (0, 0, circle_size, circle_size), fill=255
+                )
+                white = Image.new(
+                    "RGBA", (circle_size, circle_size), (255, 255, 255, 255)
+                )
+                circle.paste(white, mask=mask)
+                offset = (
+                    (circle_size - logo_img.width) // 2,
+                    (circle_size - logo_img.height) // 2,
+                )
+                circle.paste(logo_img, offset, logo_img)
+                circle = circle.resize((56, 56), Image.LANCZOS)
+                self._logo_image = ctk.CTkImage(circle, size=(56, 56))
+                logo_label = ctk.CTkLabel(
+                    parent,
+                    image=self._logo_image,
+                    text="",
+                    fg_color="transparent",
+                )
+                logo_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+                logo_label.bind("<ButtonPress-1>", self.start_move)
+                return
+            except Exception:
+                pass
+
+
+        logo_bg = ctk.CTkFrame(
+            parent, width=48, height=48,
+            fg_color=self.BTN, corner_radius=28,
+        )
+        logo_bg.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        logo_bg.grid_propagate(False)
+        logo_label = ctk.CTkLabel(
+            logo_bg, text="G",
+            font=("Arial Bold", 18),
+            text_color="#ffffff",
+        )
+        logo_label.place(relx=0.5, rely=0.5, anchor="center")
+        logo_bg.bind("<ButtonPress-1>", self.start_move)
+        logo_label.bind("<ButtonPress-1>", self.start_move)
+
     def _build_sidebar(self) -> None:
-        self.btn_load = self.make_btn("Загрузить изображение", self.load_image)
+        self.btn_load = self._make_button("Загрузить изображение", self.load_image)
         self.btn_load.pack(fill="x", padx=20, pady=(20, 8))
 
-        self.btn_run = self.make_btn("Распознать текст", self.recognize)
+        self.btn_run = self._make_button("Распознать текст", self.recognize)
         self.btn_run.pack(fill="x", padx=20, pady=8)
 
-        self.btn_clear = self.make_btn("Очистить", self.clear_all, red=True)
+        self.btn_clear = self._make_button("Очистить", self.clear_all, red=True)
         self.btn_clear.pack(fill="x", padx=20, pady=(8, 20))
 
-        history_title = ctk.CTkLabel(
+        ctk.CTkLabel(
             self.sidebar,
             text="История",
             font=("Arial Bold", 16),
             text_color=self.SUBTEXT,
-        )
-        history_title.pack(anchor="w", padx=24, pady=(0, 8))
+        ).pack(anchor="w", padx=24, pady=(0, 8))
 
         history_outer = ctk.CTkFrame(
             self.sidebar,
@@ -384,7 +654,9 @@ class App(ctk.CTk):
             highlightthickness=0,
             borderwidth=0,
         )
-        self._history_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        self._history_canvas.pack(
+            side="left", fill="both", expand=True, padx=(8, 0), pady=8
+        )
 
         history_scroll = RoundScrollbar(
             history_outer,
@@ -399,38 +671,14 @@ class App(ctk.CTk):
         self._history_canvas_window = self._history_canvas.create_window(
             (0, 0), window=self._history_frame, anchor="nw"
         )
-
         self._history_frame.bind("<Configure>", self._on_history_resize)
         self._history_canvas.bind("<Configure>", self._on_history_canvas_resize)
-        self._history_canvas.bind("<MouseWheel>", lambda e: self._history_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
-
-    def _draw_canvas_corners(self, canvas, bg_color, radius=24):
-        def redraw(event=None):
-            canvas.delete("corners")
-            w = canvas.winfo_width()
-            h = canvas.winfo_height()
-            if w < 2 or h < 2:
-                return
-            r = radius
-
-            for x, y, ax, ay in [
-                (0, 0, 0, 0),
-                (w, 0, 1, 0),
-                (0, h, 0, 1),
-                (w, h, 1, 1),
-            ]:
-                canvas.create_arc(
-                    x - r * (1 - 2*ax), y - r * (1 - 2*ay),
-                    x + r * (2*ax - 0) if ax == 0 else x - r,
-                    y + r if ay == 0 else y - r,
-                    start=[180, 270, 90, 0][int(ax*2 + ay)],
-                    extent=90,
-                    fill=bg_color,
-                    outline=bg_color,
-                    tags="corners",
-                )
-        canvas.bind("<Configure>", lambda e: redraw())
-        redraw()
+        self._history_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self._history_canvas.yview_scroll(
+                -1 * (e.delta // 120), "units"
+            ),
+        )
 
     def _build_preview(self) -> None:
         self.preview_card = ctk.CTkFrame(
@@ -444,13 +692,12 @@ class App(ctk.CTk):
         self.preview_card.grid_rowconfigure(1, weight=1)
         self.preview_card.grid_columnconfigure(0, weight=1)
 
-        title = ctk.CTkLabel(
+        ctk.CTkLabel(
             self.preview_card,
             text="Изображение",
             font=("Arial Bold", 24),
             text_color=self.TEXT,
-        )
-        title.pack(anchor="w", padx=24, pady=20)
+        ).pack(anchor="w", padx=24, pady=20)
 
         outer = ctk.CTkFrame(
             self.preview_card,
@@ -460,28 +707,38 @@ class App(ctk.CTk):
         outer.pack(expand=True, fill="both", padx=20, pady=(0, 24))
 
         self.preview_canvas = tk.Canvas(
-            outer,
-            bg=self.INPUT,
-            highlightthickness=0,
-            borderwidth=0,
+            outer, bg=self.INPUT, highlightthickness=0, borderwidth=0
         )
-
-        v_scroll = RoundScrollbar(outer, orient="vertical",
-            command=self.preview_canvas.yview, width=8)
-        h_scroll = RoundScrollbar(outer, orient="horizontal",
-            command=self.preview_canvas.xview, height=8)
-
+        v_scroll = RoundScrollbar(
+            outer, orient="vertical",
+            command=self.preview_canvas.yview, width=8,
+        )
+        h_scroll = RoundScrollbar(
+            outer, orient="horizontal",
+            command=self.preview_canvas.xview, height=8,
+        )
         self.preview_canvas.configure(
             yscrollcommand=v_scroll.set,
             xscrollcommand=h_scroll.set,
         )
-
         h_scroll.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
         v_scroll.pack(side="right", fill="y", pady=16, padx=(0, 8))
-        self.preview_canvas.pack(expand=True, fill="both", padx=(16, 0), pady=16)
+        self.preview_canvas.pack(
+            expand=True, fill="both", padx=(16, 0), pady=16
+        )
         self._draw_canvas_corners(self.preview_canvas, self.INPUT)
-        self.preview_canvas.bind("<MouseWheel>", lambda e: self.preview_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
-        self.preview_canvas.bind("<Shift-MouseWheel>", lambda e: self.preview_canvas.xview_scroll(-1 * (e.delta // 120), "units"))
+        self.preview_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self.preview_canvas.yview_scroll(
+                -1 * (e.delta // 120), "units"
+            ),
+        )
+        self.preview_canvas.bind(
+            "<Shift-MouseWheel>",
+            lambda e: self.preview_canvas.xview_scroll(
+                -1 * (e.delta // 120), "units"
+            ),
+        )
 
     def _build_result(self) -> None:
         self.result_card = ctk.CTkFrame(
@@ -495,13 +752,12 @@ class App(ctk.CTk):
         self.result_card.grid_rowconfigure(1, weight=1)
         self.result_card.grid_columnconfigure(0, weight=1)
 
-        title = ctk.CTkLabel(
+        ctk.CTkLabel(
             self.result_card,
             text="Распознанный текст",
             font=("Arial Bold", 24),
             text_color=self.TEXT,
-        )
-        title.pack(anchor="w", padx=24, pady=20)
+        ).pack(anchor="w", padx=24, pady=20)
 
         self.result = ctk.CTkTextbox(
             self.result_card,
@@ -519,7 +775,7 @@ class App(ctk.CTk):
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
             border_width=1,
-            border_color="#2a52c0",
+            border_color=self.BTN_BORDER,
             command=self.copy_text,
             width=220,
             height=48,
@@ -527,7 +783,10 @@ class App(ctk.CTk):
         )
         self.copy_btn.pack(anchor="e", padx=20, pady=18)
 
-    def make_btn(self, text: str, cmd, red: bool = False) -> ctk.CTkButton:
+
+    def _make_button(
+        self, text: str, cmd, red: bool = False
+    ) -> ctk.CTkButton:
         if red:
             return ctk.CTkButton(
                 self.sidebar,
@@ -542,7 +801,6 @@ class App(ctk.CTk):
                 command=cmd,
                 corner_radius=28,
             )
-
         return ctk.CTkButton(
             self.sidebar,
             text=text,
@@ -551,26 +809,72 @@ class App(ctk.CTk):
             fg_color=self.BTN,
             hover_color=self.BTN_HOVER,
             border_width=1,
-            border_color="#2a52c0",
+            border_color=self.BTN_BORDER,
             command=cmd,
             corner_radius=28,
         )
 
-    def _on_model_status_click(self, event=None):
-        if not self._model_path.exists():
-            self.choose_model_file()
+    @staticmethod
+    def _draw_canvas_corners(
+        canvas: tk.Canvas, bg_color: str, radius: int = 24
+    ) -> None:
 
-    def choose_model_file(self) -> None:
-        file_path = filedialog.askopenfilename(
-            filetypes=[("PyTorch модели", "*.pt *.pth"), ("Все файлы", "*.*")]
-        )
-        if file_path:
-            self._model_path = Path(file_path)
-            self._init_ocr()
+        def redraw(event=None) -> None:
+            canvas.delete("corners")
+            w = canvas.winfo_width()
+            h = canvas.winfo_height()
+            if w < 2 or h < 2:
+                return
+            r = radius
+            for x, y, ax, ay in [
+                (0, 0, 0, 0),
+                (w, 0, 1, 0),
+                (0, h, 0, 1),
+                (w, h, 1, 1),
+            ]:
+                canvas.create_arc(
+                    x - r * (1 - 2 * ax),
+                    y - r * (1 - 2 * ay),
+                    x + r * (2 * ax - 0) if ax == 0 else x - r,
+                    y + r if ay == 0 else y - r,
+                    start=[180, 270, 90, 0][int(ax * 2 + ay)],
+                    extent=90,
+                    fill=bg_color,
+                    outline=bg_color,
+                    tags="corners",
+                )
+
+        canvas.bind("<Configure>", lambda e: redraw())
+        redraw()
+
+
+    def _init_ocr(self) -> None:
+        if not self._model_path.exists():
+            self.update_status(
+                f"Модель не найдена: {self._model_path.name}"
+                " - нажмите сюда и выберите файл модели",
+                self.RED,
+            )
+            self._ocr = None
+            return
+        try:
+            self._ocr = GVisionOCR(
+                str(self._model_path),
+                device=self._device,
+                use_compile=self._use_compile,
+            )
+            self.update_status(
+                f"Модель загружена: {self._model_path.name}", self.TEXT
+            )
+        except Exception as error:
+            self._ocr = None
+            self.update_status(f"Ошибка загрузки OCR: {error}", self.RED)
 
     def recognize(self) -> None:
         if not self._ocr:
-            self.update_status("Модель не загружена - выберите нажав на линию прогресса", self.RED)
+            self.update_status(
+                "Модель не загружена — нажмите на линию прогресса", self.RED
+            )
             return
         if not self._image_path:
             self.update_status("Сначала загрузите изображение", self.RED)
@@ -590,9 +894,15 @@ class App(ctk.CTk):
             text = result.get("text", "")
             self.after(0, lambda: self._show_result(text))
         except Exception as error:
-            self.after(0, lambda: self.update_status(f"Ошибка распознавания: {error}", self.RED))
+            self.after(
+                0,
+                lambda: self.update_status(
+                    f"Ошибка распознавания: {error}", self.RED
+                ),
+            )
         finally:
             self.after(0, self._finish_processing)
+
 
     def _animate_processing(self) -> None:
         if not self._processing_animation_active:
@@ -611,36 +921,46 @@ class App(ctk.CTk):
         self._processing_animation_active = False
         self.update_status("Распознавание завершено", self.GREEN)
 
-    def _lerp_color(self, c1: str, c2: str, t: float) -> str:
+    @staticmethod
+    def _lerp_color(c1: str, c2: str, t: float) -> str:
         r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
         r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
-        r = int(r1 + (r2 - r1) * t)
-        g = int(g1 + (g2 - g1) * t)
-        b = int(b1 + (b2 - b1) * t)
-        return f"#{r:02x}{g:02x}{b:02x}"
+        return "#{:02x}{:02x}{:02x}".format(
+            int(r1 + (r2 - r1) * t),
+            int(g1 + (g2 - g1) * t),
+            int(b1 + (b2 - b1) * t),
+        )
 
     def _animate_progress_glow(self) -> None:
         if not self._processing_animation_active:
             try:
-                self.progress_container.configure(fg_color=self.BTN, border_color="#2a52c0")
+                self.progress_container.configure(
+                    fg_color=self.BTN, border_color=self.BTN_BORDER
+                )
             except Exception:
                 pass
             return
         t = (math.sin(self._glow_phase) + 1) / 2
         self._glow_phase = (self._glow_phase + 0.12) % (2 * math.pi)
-        color = self._lerp_color(self.BTN, "#3060e0", t)
-        border = self._lerp_color("#2a52c0", "#4a7aff", t)
         try:
-            self.progress_container.configure(fg_color=color, border_color=border)
+            self.progress_container.configure(
+                fg_color=self._lerp_color(self.BTN, "#3060e0", t),
+                border_color=self._lerp_color(self.BTN_BORDER, "#4a7aff", t),
+            )
         except Exception:
             pass
         self.after(40, self._animate_progress_glow)
 
-    def _on_history_resize(self, event):
-        self._history_canvas.configure(scrollregion=self._history_canvas.bbox("all"))
 
-    def _on_history_canvas_resize(self, event):
-        self._history_canvas.itemconfig(self._history_canvas_window, width=event.width)
+    def _on_history_resize(self, event) -> None:
+        self._history_canvas.configure(
+            scrollregion=self._history_canvas.bbox("all")
+        )
+
+    def _on_history_canvas_resize(self, event) -> None:
+        self._history_canvas.itemconfig(
+            self._history_canvas_window, width=event.width
+        )
 
     def _add_history_item(self, text: str) -> None:
         preview = text.strip()[:60].replace("\n", " ")
@@ -659,63 +979,64 @@ class App(ctk.CTk):
         )
         item_canvas.pack(fill="x")
 
-        def draw_item(event, canvas=item_canvas, t=preview):
+
+        state = {"fill": "#1e3a6e"}
+
+        def draw(canvas: tk.Canvas, label: str, fill: str) -> None:
+            state["fill"] = fill
             w = canvas.winfo_width()
+            if w < 2:
+                return
             canvas.delete("all")
             r = 16
             canvas.create_polygon(
-                r, 0, w-r, 0, w, 0, w, r,
-                w, 64-r, w, 64, w-r, 64,
-                r, 64, 0, 64, 0, 64-r,
+                r, 0, w - r, 0, w, 0, w, r,
+                w, 64 - r, w, 64, w - r, 64,
+                r, 64, 0, 64, 0, 64 - r,
                 0, r, 0, 0,
-                smooth=True, fill="#1e3a6e",
+                smooth=True, fill=fill,
             )
-            canvas.create_text(12, 32, text=t, fill=self.TEXT,
-                font=("Arial", 11), anchor="w", width=w-24)
-
-        def on_click(event, full=text):
-            self._show_result(full)
-
-        def on_enter(event, canvas=item_canvas, t=preview):
-            w = canvas.winfo_width()
-            canvas.delete("all")
-            r = 16
-            canvas.create_polygon(
-                r, 0, w-r, 0, w, 0, w, r,
-                w, 64-r, w, 64, w-r, 64,
-                r, 64, 0, 64, 0, 64-r,
-                0, r, 0, 0,
-                smooth=True, fill="#2a50cf",
+            canvas.create_text(
+                12, 32, text=label, fill=self.TEXT,
+                font=("Arial", 11), anchor="w", width=w - 24,
             )
-            canvas.create_text(12, 32, text=t, fill="#ffffff",
-                font=("Arial", 11), anchor="w", width=w-24)
 
-        def on_leave(event, canvas=item_canvas, t=preview):
-            w = canvas.winfo_width()
-            canvas.delete("all")
-            r = 16
-            canvas.create_polygon(
-                r, 0, w-r, 0, w, 0, w, r,
-                w, 64-r, w, 64, w-r, 64,
-                r, 64, 0, 64, 0, 64-r,
-                0, r, 0, 0,
-                smooth=True, fill="#1e3a6e",
-            )
-            canvas.create_text(12, 32, text=t, fill=self.TEXT,
-                font=("Arial", 11), anchor="w", width=w-24)
 
-        item_canvas.bind("<Configure>", draw_item)
-        item_canvas.bind("<Button-1>", on_click)
-        item_canvas.bind("<Enter>", on_enter)
-        item_canvas.bind("<Leave>", on_leave)
+        item_canvas.bind(
+            "<Configure>",
+            lambda e, c=item_canvas, t=preview: draw(c, t, state["fill"]),
+        )
+
+        item_canvas.bind(
+            "<Button-1>",
+            lambda e, full=text: self._display_text(full),
+        )
+        item_canvas.bind(
+            "<Enter>",
+            lambda e, c=item_canvas, t=preview: draw(c, t, "#2a50cf"),
+        )
+        item_canvas.bind(
+            "<Leave>",
+            lambda e, c=item_canvas, t=preview: draw(c, t, "#1e3a6e"),
+        )
 
         self._history_items.append(item_frame)
+
+
+        self._history_frame.update_idletasks()
+        self._history_canvas.configure(
+            scrollregion=self._history_canvas.bbox("all")
+        )
         self._history_canvas.yview_moveto(1.0)
 
-    def _show_result(self, text: str) -> None:
+
+    def _display_text(self, text: str) -> None:
         self.result.delete("1.0", "end")
         self.result.insert("1.0", text)
         self.update_status("Текст успешно распознан", self.GREEN)
+
+    def _show_result(self, text: str) -> None:
+        self._display_text(text)
         self._add_history_item(text)
 
     def copy_text(self) -> None:
@@ -739,52 +1060,48 @@ class App(ctk.CTk):
         )
         if not file_path:
             return
-
         self._image_path = Path(file_path)
         image = Image.open(file_path).convert("RGB")
-
         radius = min(32, min(image.size) // 8)
         rounded = self._make_rounded_image(image, radius=radius)
-
         self._canvas_image_ref = ImageTk.PhotoImage(rounded)
         self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(0, 0, image=self._canvas_image_ref, anchor="nw")
-        self.preview_canvas.configure(scrollregion=(0, 0, rounded.width, rounded.height))
-
+        self.preview_canvas.create_image(
+            0, 0, image=self._canvas_image_ref, anchor="nw"
+        )
+        self.preview_canvas.configure(
+            scrollregion=(0, 0, rounded.width, rounded.height)
+        )
         self.update_status("Изображение загружено", self.TEXT)
 
-    def _init_ocr(self) -> None:
-        if not self._model_path.exists():
-            self.update_status(
-                f"Модель не найдена: {self._model_path.name} — нажмите сюда и выберите файл модели",
-                self.RED,
-            )
-            self._ocr = None
-            return
+    def choose_model_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ("PyTorch модели", "*.pt *.pth"),
+                ("Все файлы", "*.*"),
+            ]
+        )
+        if file_path:
+            self._model_path = Path(file_path)
+            self._init_ocr()
 
-        try:
-            self._ocr = GVisionOCR(
-                str(self._model_path),
-                device=self._device,
-                use_compile=self._use_compile,
-            )
-            self.update_status(f"Модель загружена: {self._model_path.name}", self.TEXT)
-        except Exception as error:
-            self._ocr = None
-            self.update_status(f"Ошибка загрузки OCR: {error}", self.RED)
-
-    def _make_rounded_image(self, image: Image.Image, radius: int) -> Image.Image:
+    def _make_rounded_image(
+        self, image: Image.Image, radius: int
+    ) -> Image.Image:
         image = image.convert("RGBA")
         mask = Image.new("L", image.size, 0)
-        draw = ImageDraw.Draw(mask)
-        draw.rounded_rectangle((0, 0, image.width, image.height), radius=radius, fill=255)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, image.width, image.height), radius=radius, fill=255
+        )
         image.putalpha(mask)
-
         rounded = Image.new("RGBA", image.size, self.INPUT)
         rounded.paste(image, (0, 0), image)
         return rounded
 
-    def update_status(self, text: str, text_color: Optional[str] = None) -> None:
+
+    def update_status(
+        self, text: str, text_color: Optional[str] = None
+    ) -> None:
         try:
             self.header_status_label.configure(
                 text=text,
@@ -792,6 +1109,11 @@ class App(ctk.CTk):
             )
         except Exception:
             pass
+
+    def _on_model_status_click(self, event=None) -> None:
+        if not self._model_path.exists():
+            self.choose_model_file()
+
 
     def start_move(self, event) -> None:
         self._drag_position = (event.x_root, event.y_root)
@@ -801,9 +1123,9 @@ class App(ctk.CTk):
             return
         delta_x = event.x_root - self._drag_position[0]
         delta_y = event.y_root - self._drag_position[1]
-        x = self.winfo_x() + delta_x
-        y = self.winfo_y() + delta_y
-        self.geometry(f"+{x}+{y}")
+        self.geometry(
+            f"+{self.winfo_x() + delta_x}+{self.winfo_y() + delta_y}"
+        )
         self._drag_position = (event.x_root, event.y_root)
 
     def close(self) -> None:
