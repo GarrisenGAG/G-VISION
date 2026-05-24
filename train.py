@@ -1,716 +1,814 @@
-#!/usr/bin/env python3
-import argparse
-import random
 import sys
-import time
-from dataclasses import dataclass
+import math
+import platform
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from torch.amp import autocast, GradScaler
-from tqdm import tqdm
-
-try:
-    from numba import jit
-except ImportError:
-    def jit(**kwargs):
-        def decorator(func):
-            return func
-        return decorator
-
-from PIL import Image, ImageFilter
-
-
-class SystemLogger:
-    def __init__(self, log_path: Optional[Path] = None):
-        self.log_path = log_path
-        if log_path:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def __call__(self, message: str) -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
-        print(line)
-        if self.log_path:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] {message}\n")
-
-
-@dataclass
-class SessionParameters:
-    base_dir: Path = Path("DataSet/Train")
-    cache_path: Path = Path("DataSet/dataset_cache_clean.pt")
-    img_height: int = 64
-    max_width: int = 1024
-    batch_size: int = 32
-    gradient_accumulation: int = 1
-    num_workers: int = 0
-    prefetch_factor: int = 2
-    use_amp: bool = False
-    use_compile: bool = False
-    val_frequency: int = 1
-    resume: bool = True
-    learning_rate: float = 1e-4
-    weight_decay: float = 5e-4
-    grad_clip: float = 1.0
-    epochs: int = 100
-    patience: int = 20
-    warmup_epochs: int = 5
-    max_samples: int = 3_003_000
-    aug_prob: float = 0.60
-    aug_rotate: float = 4.0
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_dir: Path = Path("runs/ocr_final")
-    model_name: str = "best_model.pt"
-    log_file: str = "training_log.txt"
-    seed: int = 42
-
-
-class SymbolEncoder:
-    def __init__(self):
-        self.vocabulary = ["<blank>", " "] + \
-            list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя") + \
-            list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ") + \
-            list("0123456789") + \
-            list(".,!?;:-—()[]«»\"'/@#№$%&*+=<>~^_{}|\\")
-        self.char_to_idx = {ch: i for i, ch in enumerate(self.vocabulary)}
-        self.idx_to_char = {i: ch for ch, i in self.char_to_idx.items()}
-        self.size = len(self.vocabulary)
-
-    def encode(self, text: str) -> List[int]:
-        return [self.char_to_idx.get(ch, 0) for ch in text]
-
-    def decode(self, indices: List[int], merge_repeats: bool = True, skip_blank: bool = True) -> str:
-        output = []
-        prev = -1
-        for idx in indices:
-            if merge_repeats and idx == prev:
-                continue
-            if skip_blank and idx == 0:
-                prev = idx
-                continue
-            output.append(self.idx_to_char.get(idx, ""))
-            prev = idx
-        return "".join(output)
-
-
-class AlignmentEvaluator:
-    @staticmethod
-    def levenshtein(s1: str, s2: str) -> int:
-        if len(s1) < len(s2):
-            return AlignmentEvaluator.levenshtein(s2, s1)
-        if not s2:
-            return len(s1)
-        prev = list(range(len(s2) + 1))
-        for c1 in s1:
-            curr = [prev[0] + 1]
-            for j, c2 in enumerate(s2):
-                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
-            prev = curr
-        return prev[-1]
-
-    @staticmethod
-    @jit(nopython=True)
-    def _levenshtein_fast(s1_codes, s2_codes):
-        len1, len2 = len(s1_codes), len(s2_codes)
-        if len1 < len2:
-            s1_codes, s2_codes = s2_codes, s1_codes
-            len1, len2 = len2, len1
-        if len2 == 0:
-            return len1
-        prev = np.arange(len2 + 1, dtype=np.int32)
-        curr = np.zeros(len2 + 1, dtype=np.int32)
-        for i in range(len1):
-            curr[0] = i + 1
-            for j in range(len2):
-                cost = 0 if s1_codes[i] == s2_codes[j] else 1
-                curr[j + 1] = min(prev[j + 1] + 1, curr[j] + 1, prev[j] + cost)
-            prev, curr = curr, prev
-        return prev[len2]
-
-    @staticmethod
-    def compute_distance(s1: str, s2: str) -> float:
-        if len(s1) < len(s2):
-            s1, s2 = s2, s1
-        if not s2:
-            return float(len(s1))
-        if len(s1) < 5 and len(s2) < 5:
-            return float(AlignmentEvaluator.levenshtein(s1, s2))
-        try:
-            s1_codes = np.array([ord(c) for c in s1], dtype=np.int32)
-            s2_codes = np.array([ord(c) for c in s2], dtype=np.int32)
-            return float(AlignmentEvaluator._levenshtein_fast(s1_codes, s2_codes))
-        except Exception:
-            return float(AlignmentEvaluator.levenshtein(s1, s2))
-
-    @staticmethod
-    def calculate_error_rate(prediction: str, target: str) -> float:
-        if not target:
-            return 0.0 if not prediction else 1.0
-        return AlignmentEvaluator.compute_distance(prediction, target) / len(target)
-
-
-class VisualAugmentor:
-    def __init__(self, probability: float = 0.60, rotation_limit: float = 4.0):
-        self.probability = probability
-        self.rotation_limit = rotation_limit
-        self.blur_filter = ImageFilter.GaussianBlur
-
-    @staticmethod
-    @jit(nopython=True)
-    def _adjust_brightness(arr, factor):
-        return np.clip(arr * factor, 0.0, 1.0)
-
-    @staticmethod
-    @jit(nopython=True)
-    def _adjust_contrast(arr, factor):
-        mean = np.mean(arr)
-        adjusted = (arr - mean) * factor + mean
-        return np.clip(adjusted, 0.0, 1.0)
-
-    @staticmethod
-    @jit(nopython=True)
-    def _apply_noise(arr, std):
-        noise = np.random.randn(arr.shape[0], arr.shape[1]) * std
-        return np.clip(arr + noise, 0.0, 1.0)
-
-    def __call__(self, image: Image.Image) -> Image.Image:
-        if random.random() > self.probability:
-            return image
-        if random.random() < 0.40:
-            arr = np.array(image).astype(np.float32) / 255.0
-            arr = self._adjust_brightness(arr, random.uniform(0.70, 1.30))
-            image = Image.fromarray((arr * 255).astype(np.uint8))
-        if random.random() < 0.40:
-            arr = np.array(image).astype(np.float32) / 255.0
-            arr = self._adjust_contrast(arr, random.uniform(0.70, 1.30))
-            image = Image.fromarray((arr * 255).astype(np.uint8))
-        if random.random() < 0.25:
-            image = image.filter(self.blur_filter(radius=random.uniform(0.5, 1.5)))
-        if random.random() < 0.35:
-            image = image.rotate(random.uniform(-self.rotation_limit, self.rotation_limit), fillcolor=255, expand=False)
-        if random.random() < 0.15:
-            arr = np.array(image).astype(np.float32) / 255.0
-            arr = self._apply_noise(arr, 0.03)
-            image = Image.fromarray((arr * 255).astype(np.uint8))
-        return image
-
-
-class ImageSequenceDataset(Dataset):
-    def __init__(self, paths: List[Path], texts: List[str], encoder: SymbolEncoder, apply_augmentation: bool = False, params: Optional[SessionParameters] = None):
-        self.paths = paths
-        self.texts = texts
-        self.encoder = encoder
-        self.apply_augmentation = apply_augmentation
-        self.transformer = VisualAugmentor(params.aug_prob, params.aug_rotate) if apply_augmentation else None
-        self.target_height = params.img_height
-        self.max_width = params.max_width
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        img_path = self.paths[idx]
-        text = self.texts[idx]
-        try:
-            img = Image.open(img_path).convert("L")
-        except Exception:
-            img = Image.new("L", (128, self.target_height), 255)
-        if self.apply_augmentation and self.transformer:
-            img = self.transformer(img)
-        width, height = img.size
-        if height != self.target_height:
-            width = max(32, int(round(width * (self.target_height / height))))
-            img = img.resize((width, self.target_height), Image.Resampling.LANCZOS)
-        if img.width > self.max_width:
-            img = img.resize((self.max_width, self.target_height), Image.Resampling.LANCZOS)
-        tensor = transforms.ToTensor()(img)
-        tensor = 1.0 - tensor
-        ids = torch.tensor(self.encoder.encode(text), dtype=torch.long)
-        return {"img": tensor, "ids": ids, "text": text, "len": len(ids)}
-
-
-def assemble_batch(batch: List[Dict[str, Any]], params: SessionParameters) -> Dict[str, Any]:
-    max_width = min(max(item["img"].shape[-1] for item in batch), params.max_width)
-    batch_size = len(batch)
-    imgs = torch.zeros(batch_size, 1, params.img_height, max_width)
-    lengths = []
-    texts = []
-    for i, item in enumerate(batch):
-        width = item["img"].shape[-1]
-        imgs[i, :, :, :width] = item["img"]
-        lengths.append(item["len"])
-        texts.append(item["text"])
-    return {
-        "imgs": imgs,
-        "ids": torch.cat([item["ids"] for item in batch]),
-        "lens": torch.tensor(lengths, dtype=torch.long),
-        "texts": texts
-    }
-
-
-class SpatialLayer(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel: int = 3, padding: int = 1, pool: Optional[Tuple[int, int]] = None):
-        super().__init__()
-        layers = [
-            nn.Conv2d(in_channels, out_channels, kernel, padding=padding, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        ]
-        if pool:
-            layers.append(nn.MaxPool2d(pool))
-        self.block = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class ResidualUnit(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels)
-        )
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.body(x))
-
-
-class SequenceAligner(nn.Module):
-    def __init__(self, output_dim: int, hidden_size: int = 320, use_final_conv: bool = True, legacy: bool = False):
-        super().__init__()
-        layers = [
-            SpatialLayer(1, 64, pool=(2, 2)),
-            ResidualUnit(64),
-            SpatialLayer(64, 128, pool=(2, 2)),
-            ResidualUnit(128),
-            SpatialLayer(128, 256, pool=(2, 1)),
-            ResidualUnit(256),
-            SpatialLayer(256, 512, pool=(2, 1)),
-        ]
-        if legacy:
-            layers.append(SpatialLayer(512, 512, kernel=2, padding=0))
-        else:
-            layers.append(ResidualUnit(512))
-            if use_final_conv:
-                layers.append(SpatialLayer(512, 512, kernel=2, padding=0))
-        self.extractor = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool2d((1, None))
-        self.recurrence = nn.LSTM(512, hidden_size, num_layers=2, bidirectional=True, batch_first=True, dropout=0.5)
-        self.projection = nn.Sequential(
-            nn.LayerNorm(hidden_size * 2),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_size * 2, output_dim)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.extractor(x)
-        x = self.pool(x)
-        x = x.squeeze(2).permute(0, 2, 1)
-        x, _ = self.recurrence(x)
-        x = self.projection(x)
-        return x.permute(1, 0, 2).log_softmax(2)
-
-
-class PipelineController:
-    def __init__(self, aligner: nn.Module, device: torch.device, steps_per_epoch: int, params: SessionParameters):
-        self.aligner = aligner
-        self.device = device
-        self.loss_fn = nn.CTCLoss(blank=0, zero_infinity=True, reduction="mean")
-        self.scaler = GradScaler(enabled=(self.device.type == "cuda" and params.use_amp))
-        self.optimizer = torch.optim.AdamW(aligner.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
-        warmup_epochs = min(params.warmup_epochs, max(1, params.epochs - 1))
-        pct_start = max(0.1, min(0.95, warmup_epochs / max(1, params.epochs)))
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer, max_lr=params.learning_rate, epochs=params.epochs,
-            steps_per_epoch=steps_per_epoch, pct_start=pct_start, div_factor=10, final_div_factor=100
-        )
-        self.best_metric = 1.0
-        self.patience_counter = 0
-        self.params = params
-
-    def execute_training_pass(self, loader: DataLoader) -> float:
-        self.aligner.train()
-        total_loss = 0.0
-        total_samples = 0
-        self.optimizer.zero_grad()
-
-        for step, batch in enumerate(tqdm(loader, desc="Training", ncols=100, leave=False), start=1):
-            x = batch["imgs"].to(self.device, non_blocking=True)
-            y = batch["ids"].to(self.device, non_blocking=True)
-            lengths = batch["lens"].to(self.device, non_blocking=True)
-
-            with autocast(device_type=self.device.type, enabled=(self.device.type == "cuda" and self.params.use_amp)):
-                logits = self.aligner(x)
-                input_lengths = torch.full((x.size(0),), logits.size(0), dtype=torch.long, device=self.device)
-                loss = self.loss_fn(logits, y, input_lengths, lengths)
-
-            if torch.isnan(loss):
-                self.optimizer.zero_grad()
-                continue
-
-            loss = loss / self.params.gradient_accumulation
-            self.scaler.scale(loss).backward()
-
-            if step % self.params.gradient_accumulation == 0 or step == len(loader):
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.aligner.parameters(), self.params.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-
-            total_loss += loss.item() * self.params.gradient_accumulation * x.size(0)
-            total_samples += x.size(0)
-
-        return total_loss / max(total_samples, 1)
-
-    def execute_evaluation_pass(self, loader: DataLoader, encoder: SymbolEncoder) -> Tuple[float, float]:
-        self.aligner.eval()
-        total_loss = 0.0
-        metrics = []
-
-        with torch.no_grad():
-            for batch in tqdm(loader, desc="Evaluation", ncols=100, leave=False):
-                x = batch["imgs"].to(self.device, non_blocking=True)
-                y = batch["ids"].to(self.device, non_blocking=True)
-                lengths = batch["lens"].to(self.device, non_blocking=True)
-
-                logits = self.aligner(x).float()
-                input_lengths = torch.full((x.size(0),), logits.size(0), dtype=torch.long, device=self.device)
-                loss = self.loss_fn(logits, y, input_lengths, lengths)
-                total_loss += loss.item() * x.size(0)
-
-                preds = logits.argmax(2).cpu().numpy().T
-                for seq, target in zip(preds, batch["texts"]):
-                    decoded = encoder.decode(seq.tolist())
-                    metrics.append(AlignmentEvaluator.calculate_error_rate(decoded, target))
-
-        return total_loss / max(1, len(loader.dataset)), float(np.mean(metrics))
-
-    def persist_state(self, path: Path, metrics: Dict[str, Any], is_best: bool = False) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"aligner": self.aligner.state_dict(), "metrics": metrics, "best": is_best}, path)
-
-    def persist_checkpoint(self, path: Path, epoch: int) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "epoch": epoch, "aligner_state": self.aligner.state_dict(),
-            "opt_state": self.optimizer.state_dict(),
-            "sched_state": self.scheduler.state_dict(),
-            "best_metric": self.best_metric, "patience": self.patience_counter
-        }, path)
-
-    def restore_checkpoint(self, path: Path) -> int:
-        state = torch.load(path, map_location=self.device)
-        self.aligner.load_state_dict(state["aligner_state"])
-        self.optimizer.load_state_dict(state["opt_state"])
-        self.scheduler.load_state_dict(state["sched_state"])
-        self.best_metric = state.get("best_metric", self.best_metric)
-        self.patience_counter = state.get("patience", self.patience_counter)
-        return state.get("epoch", 0)
-
-
-class Orchestrator:
-    def __init__(self):
-        self.params = SessionParameters()
-        self.logger = SystemLogger()
-        self.encoder = SymbolEncoder()
-
-    def parse_arguments(self) -> argparse.Namespace:
-        parser = argparse.ArgumentParser(description="Sequence alignment and processing pipeline")
-        parser.add_argument("--mode", choices=["train", "eval", "infer"], default="train")
-        parser.add_argument("--infer-path", type=str, nargs="+", default=None)
-        parser.add_argument("--sample-count", type=int, default=10)
-        parser.add_argument("--resume", action="store_true", default=True)
-        parser.add_argument("--no-resume", action="store_false", dest="resume")
-        parser.add_argument("--epochs", type=int, default=None)
-        parser.add_argument("--batch-size", type=int, default=None)
-        parser.add_argument("--max-samples", type=int, default=None)
-        parser.add_argument("--num-workers", type=int, default=None)
-        parser.add_argument("--learning-rate", type=float, default=None)
-        parser.add_argument("--val-frequency", type=int, default=None)
-        parser.add_argument("--seed", type=int, default=None)
-        return parser.parse_args()
-
-    def apply_arguments(self, args: argparse.Namespace) -> None:
-        if args.infer_path:
-            args.infer_path = " ".join(args.infer_path)
-        self.params.resume = args.resume
-        if args.epochs is not None:
-            self.params.epochs = args.epochs
-        if args.batch_size is not None:
-            self.params.batch_size = args.batch_size
-        if args.max_samples is not None:
-            self.params.max_samples = args.max_samples
-        if args.num_workers is not None:
-            self.params.num_workers = args.num_workers
-        if args.learning_rate is not None:
-            self.params.learning_rate = args.learning_rate
-        if args.val_frequency is not None:
-            self.params.val_frequency = args.val_frequency
-        if args.seed is not None:
-            self.params.seed = args.seed
-
-    def setup_environment(self) -> torch.device:
-        random.seed(self.params.seed)
-        np.random.seed(self.params.seed)
-        torch.manual_seed(self.params.seed)
-        torch.cuda.manual_seed_all(self.params.seed)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.set_float32_matmul_precision("high")
-
-        device = torch.device(self.params.device)
-        if device.type == "cuda":
-            try:
-                torch.cuda.init()
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.empty_cache()
-            except RuntimeError as e:
-                self.logger(f"CUDA initialization failed: {e}. Falling back to CPU.")
-                device = torch.device("cpu")
-        return device
-
-    def load_data(self) -> Tuple[List[Path], List[str]]:
-        if not self.params.cache_path.exists():
-            self.logger("Cache file not found. Please generate dataset cache first.")
-            sys.exit(1)
-        cached = torch.load(self.params.cache_path, weights_only=False)
-        paths, texts = cached["image_paths"], cached["texts"]
-        if len(paths) > self.params.max_samples:
-            selected = random.sample(range(len(paths)), self.params.max_samples)
-            paths = [paths[i] for i in selected]
-            texts = [texts[i] for i in selected]
-        return paths, texts
-
-    def prepare_loaders(self, paths: List[Path], texts: List[str], device: torch.device) -> Tuple[DataLoader, DataLoader]:
-        indices = list(range(len(paths)))
-        random.shuffle(indices)
-        n_train = int(len(paths) * 0.90)
-        n_val = int(len(paths) * 0.05)
-        train_paths = [paths[i] for i in indices[:n_train]]
-        train_texts = [texts[i] for i in indices[:n_train]]
-        val_paths = [paths[i] for i in indices[n_train:n_train + n_val]]
-        val_texts = [texts[i] for i in indices[n_train:n_train + n_val]]
-
-        train_ds = ImageSequenceDataset(train_paths, train_texts, self.encoder, True, self.params)
-        val_ds = ImageSequenceDataset(val_paths, val_texts, self.encoder, False, self.params)
-
-        loader_args = {
-            "collate_fn": lambda b: assemble_batch(b, self.params),
-            "pin_memory": device.type == "cuda",
-            "persistent_workers": self.params.num_workers > 0,
-        }
-        if self.params.num_workers > 0:
-            loader_args["prefetch_factor"] = self.params.prefetch_factor
-
-        train_loader = DataLoader(train_ds, batch_size=self.params.batch_size, shuffle=True, num_workers=self.params.num_workers, drop_last=True, **loader_args)
-        val_loader = DataLoader(val_ds, batch_size=self.params.batch_size, shuffle=False, num_workers=self.params.num_workers, drop_last=False, **loader_args)
-        return train_loader, val_loader
-
-    def initialize_aligner(self, device: torch.device, weights: Optional[Dict] = None) -> SequenceAligner:
-        legacy = False
-        use_final_conv = True
-        hidden_size = 320
-        if weights:
-            if "rnn.weight_ih_l0" in weights and weights["rnn.weight_ih_l0"].shape[0] == 1024:
-                legacy = True
-            if "classifier.2.weight" in weights and weights["classifier.2.weight"].shape[1] == 512:
-                legacy = True
-            if "cnn.7.block.0.weight" in weights or "cnn.7.block.1.weight" in weights:
-                use_final_conv = True
-            elif "cnn.8.block.0.weight" in weights or "cnn.8.block.1.weight" in weights:
-                use_final_conv = True
-            hidden_size = 256 if legacy else 320
-
-        aligner = SequenceAligner(self.encoder.size, hidden_size, use_final_conv, legacy).to(device)
-        if weights:
-            compatible = {k: v for k, v in weights.items() if k in aligner.state_dict() and v.shape == aligner.state_dict()[k].shape}
-            aligner.load_state_dict(compatible, strict=False)
-        return aligner
-
-    def run_inference(self, aligner: SequenceAligner, image_path: str, device: torch.device) -> str:
-        aligner.eval()
-        img = Image.open(image_path).convert("L")
-        width, height = img.size
-        if height != self.params.img_height:
-            width = max(32, int(round(width * (self.params.img_height / height))))
-            img = img.resize((width, self.params.img_height), Image.Resampling.LANCZOS)
-        if img.width > self.params.max_width:
-            img = img.resize((self.params.max_width, self.params.img_height), Image.Resampling.LANCZOS)
-        tensor = transforms.ToTensor()(img)
-        tensor = (1.0 - tensor).unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = aligner(tensor)
-        seq = logits.argmax(2).cpu().numpy().T[0]
-        return self.encoder.decode(seq.tolist())
-
-    def execute(self) -> None:
-        args = self.parse_arguments()
-        self.apply_arguments(args)
-        self.logger("=" * 60)
-        self.logger("Sequence Alignment Pipeline Started")
-        self.logger(f"Mode: {args.mode}")
-        self.logger("=" * 60)
-
-        if torch.cuda.is_available():
-            self.logger(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-        else:
-            self.logger("CPU mode active")
-
-        self.params.save_dir.mkdir(parents=True, exist_ok=True)
-        self.logger = SystemLogger(self.params.save_dir / self.params.log_file)
-
-        device = self.setup_environment()
-        paths, texts = self.load_data()
-        self.logger(f"Loaded {len(paths):,} valid samples")
-        if len(paths) > self.params.max_samples:
-            self.logger(f"Restricted to {len(paths):,} samples for processing speed")
-
-        train_loader, val_loader = self.prepare_loaders(paths, texts, device)
-        checkpoint_path = self.params.save_dir / "checkpoint.pt"
-        best_model_path = self.params.save_dir / self.params.model_name
-
-        weights = None
-        if self.params.resume and best_model_path.exists() and not checkpoint_path.exists():
-            state = torch.load(best_model_path, map_location=device, weights_only=False)
-            weights = state.get("aligner", state)
-
-        aligner = self.initialize_aligner(device, weights)
-        controller = PipelineController(aligner, device, len(train_loader), self.params)
-
-        start_epoch = 1
-        if self.params.resume and checkpoint_path.exists():
-            loaded_epoch = controller.restore_checkpoint(checkpoint_path)
-            start_epoch = min(loaded_epoch + 1, self.params.epochs)
-            self.logger(f"Resumed from checkpoint: epoch {loaded_epoch}, best metric={controller.best_metric:.4f}")
-        elif self.params.resume and best_model_path.exists():
-            self.logger(f"Loaded weights from {best_model_path} for continuation")
-
-        if args.mode == "eval":
-            _, val_metric = controller.execute_evaluation_pass(val_loader, self.encoder)
-            self.logger(f"Evaluation complete. Metric: {val_metric:.4f}")
-            examples = []
-            with torch.no_grad():
-                for batch in val_loader:
-                    x = batch["imgs"].to(device, non_blocking=True)
-                    logits = aligner(x).float()
-                    preds = logits.argmax(2).cpu().numpy().T
-                    for seq, target in zip(preds, batch["texts"]):
-                        if len(examples) >= args.sample_count:
-                            break
-                        examples.append((target, self.encoder.decode(seq.tolist())))
-                    if len(examples) >= args.sample_count:
-                        break
-            for idx, (target, pred) in enumerate(examples, 1):
-                self.logger(f"  {idx}. Ground: {target}")
-                self.logger(f"     Pred:   {pred}")
+from typing import Optional, Tuple
+import tkinter as tk
+import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
+from tkinter import filedialog
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+class RoundScrollbar(tk.Canvas):
+    def __init__(self, parent, orient="vertical", command=None,
+                 bg="#14306a", thumb_color="#1e40af", hover_color="#2a50cf", **kwargs):
+        super().__init__(parent, bg=bg, highlightthickness=0, borderwidth=0, **kwargs)
+        self._orient = orient
+        self._command = command
+        self._thumb_color = thumb_color
+        self._hover_color = hover_color
+        self._bg = bg
+        self._pos = (0.0, 1.0)
+        self._dragging = False
+        self._drag_start = None
+
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", lambda e: self._draw(hover=True))
+        self.bind("<Leave>", lambda e: self._draw(hover=False))
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, lo, hi):
+        self._pos = (float(lo), float(hi))
+        self._draw()
+
+    def _draw(self, hover=False):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 2 or h < 2:
             return
 
-        if args.mode == "infer":
-            if not args.infer_path:
-                self.logger("Please provide --infer-path for inference mode")
-                sys.exit(1)
-            pred = self.run_inference(aligner, args.infer_path, device)
-            self.logger(f"Inference: {Path(args.infer_path).name} -> {pred}")
-            return
+        lo, hi = self._pos
+        color = self._hover_color if hover else self._thumb_color
 
-        if self.params.use_compile and hasattr(torch, "compile"):
-            try:
-                import triton
-                aligner = torch.compile(aligner, backend="inductor", mode="reduce-overhead")
-                controller.aligner = aligner
-                self.logger("Compilation enabled")
-            except ImportError:
-                self.logger("Triton not available. Compilation disabled.")
-            except Exception as exc:
-                self.logger(f"Compilation failed: {exc}")
-                self.params.use_compile = False
-
-        self.logger(f"Parameters: {sum(p.numel() for p in controller.aligner.parameters()):,}")
-        self.logger(f"Starting session: epochs={self.params.epochs}, batch={self.params.batch_size * self.params.gradient_accumulation}, lr={self.params.learning_rate}, resume_from={start_epoch}")
-
-        for epoch in range(start_epoch, self.params.epochs + 1):
-            start_time = time.time()
-            train_loss = controller.execute_training_pass(train_loader)
-            elapsed = time.time() - start_time
-
-            if epoch == 1 or epoch % self.params.val_frequency == 0:
-                val_loss, val_metric = controller.execute_evaluation_pass(val_loader, self.encoder)
-                self.logger(f"Epoch {epoch}/{self.params.epochs} | Train Loss={train_loss:.4f} | Val Loss={val_loss:.4f} | Metric={val_metric:.4f} | Time={elapsed/60:.1f}m")
-
-                if val_metric < controller.best_metric:
-                    controller.best_metric = val_metric
-                    controller.patience_counter = 0
-                    controller.persist_state(self.params.save_dir / self.params.model_name, {"metric": val_metric, "epoch": epoch}, is_best=True)
-                    self.logger(f"New best metric: {val_metric:.4f}")
-                else:
-                    controller.patience_counter += 1
-                    if controller.patience_counter >= self.params.patience:
-                        self.logger(f"Early stopping at epoch {epoch}")
-                        break
-            else:
-                self.logger(f"Epoch {epoch}/{self.params.epochs} | Train Loss={train_loss:.4f} | Val=n/a | Metric=n/a | Time={elapsed/60:.1f}m")
-
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-        self.logger("=" * 60)
-        self.logger(f"Session complete. Best metric: {controller.best_metric:.4f}")
-        self.logger("=" * 60)
-
-
-class GVisionOCR:
-    def __init__(self, model_path: str, device: str = "auto", use_compile: bool = False):
-        self.encoder = SymbolEncoder()
-        self.params = SessionParameters()
-
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self._orient == "vertical":
+            pad = 2
+            x0, x1 = pad, w - pad
+            y0 = lo * h + pad
+            y1 = hi * h - pad
         else:
-            self.device = torch.device(device)
+            pad = 2
+            y0, y1 = pad, h - pad
+            x0 = lo * w + pad
+            x1 = hi * w - pad
 
-        state = torch.load(model_path, map_location=self.device, weights_only=False)
-        weights = state.get("aligner", state)
+        r = (x1 - x0) // 2 if self._orient == "vertical" else (y1 - y0) // 2
+        r = max(r, 4)
+        self.create_rounded_rect(x0, y0, x1, y1, r, fill=color)
 
-        legacy = False
-        use_final_conv = True
-        hidden_size = 320
-        if "rnn.weight_ih_l0" in weights and weights["rnn.weight_ih_l0"].shape[0] == 1024:
-            legacy = True
-        if "classifier.2.weight" in weights and weights["classifier.2.weight"].shape[1] == 512:
-            legacy = True
-        if legacy:
-            hidden_size = 256
+    def create_rounded_rect(self, x0, y0, x1, y1, r, **kwargs):
+        self.create_polygon(
+            x0 + r, y0,
+            x1 - r, y0,
+            x1, y0,
+            x1, y0 + r,
+            x1, y1 - r,
+            x1, y1,
+            x1 - r, y1,
+            x0 + r, y1,
+            x0, y1,
+            x0, y1 - r,
+            x0, y0 + r,
+            x0, y0,
+            smooth=True, **kwargs
+        )
 
-        self.aligner = SequenceAligner(
-            self.encoder.size, hidden_size, use_final_conv, legacy
-        ).to(self.device)
+    def _on_press(self, event):
+        self._dragging = True
+        self._drag_start = event.y if self._orient == "vertical" else event.x
 
-        compatible = {
-            k: v for k, v in weights.items()
-            if k in self.aligner.state_dict()
-            and v.shape == self.aligner.state_dict()[k].shape
-        }
-        self.aligner.load_state_dict(compatible, strict=False)
-        self.aligner.eval()
+    def _on_drag(self, event):
+        if not self._dragging or self._drag_start is None:
+            return
+        w = self.winfo_width()
+        h = self.winfo_height()
+        size = h if self._orient == "vertical" else w
+        delta = ((event.y if self._orient == "vertical" else event.x) - self._drag_start) / size
+        self._drag_start = event.y if self._orient == "vertical" else event.x
+        if self._command:
+            self._command("moveto", self._pos[0] + delta)
 
-        if use_compile and hasattr(torch, "compile"):
+    def _on_release(self, event):
+        self._dragging = False
+
+
+class App(ctk.CTk):
+    WIDTH = 1400
+    HEIGHT = 920
+
+    BG = "#020208"
+    SIDEBAR = "#0a1a4b"
+    PANEL = "#0a1a4b"
+    INPUT = "#14306a"
+    BTN = "#1e40af"
+    BTN_HOVER = "#15307f"
+    GREEN = "#22c55e"
+    RED = "#ef4444"
+    TEXT = "#e6eefc"
+    SUBTEXT = "#94a3b8"
+    CORNER_RADIUS = 32
+    TRANSPARENT = "#010101"
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self._window_rounded = False
+        self.overrideredirect(True)
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        self.minsize(1100, 760)
+        self.title("G-Vision")
+
+        if platform.system() == "Windows":
+            self.configure(fg_color=self.TRANSPARENT)
+        else:
+            self.configure(fg_color=self.BG)
+
+        self._apply_window_rounding()
+
+        self._image_path: Optional[Path] = None
+        self._preview = None
+        self._ocr = None
+        self._drag_position: Optional[Tuple[int, int]] = None
+        self._processing_animation_active = False
+        self._processing_dots = 0
+        self._glow_phase = 0.0
+        self.executor = ThreadPoolExecutor(max_workers=1)
+
+        self._model_path = Path(__file__).parent / "best.pt"
+        self._device = "auto"
+        self._use_compile = False
+        self._canvas_image_ref = None
+        self._history_items = []
+
+        self._build()
+        self._init_ocr()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _apply_window_rounding(self) -> None:
+        system = platform.system()
+        if system == "Windows":
+            # цветовой ключ: пиксели TRANSPARENT становятся прозрачными
             try:
-                self.aligner = torch.compile(self.aligner)
+                self.wm_attributes("-transparentcolor", self.TRANSPARENT)
+                self._window_rounded = True
+            except Exception:
+                pass
+        elif system == "Darwin":
+            # alpha-прозрачность: области с alpha=0 показывают рабочий стол
+            try:
+                self.wm_attributes("-transparent", True)
+                self._window_rounded = True
             except Exception:
                 pass
 
+    def _build(self) -> None:
+        system = platform.system()
+        if system == "Windows":
+            # углы _bg_frame рисуются цветом TRANSPARENT (#010101) → прозрачные через -transparentcolor
+            self._bg_frame = ctk.CTkFrame(
+                self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS,
+                border_width=2, border_color="#081327",
+            )
+            self._bg_frame.place(x=0, y=0, relwidth=1, relheight=1)
+            self._bg_frame.lower()
+        elif system == "Darwin":
+            # bg_color="systemTransparent" → углы имеют alpha=0 → прозрачные через -transparent True
+            self._bg_frame = ctk.CTkFrame(
+                self, fg_color=self.BG, corner_radius=self.CORNER_RADIUS,
+                border_width=2, border_color="#081327",
+                bg_color="systemTransparent",
+            )
+            self._bg_frame.place(x=0, y=0, relwidth=1, relheight=1)
+            self._bg_frame.lower()
+
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+
+        self._build_header()
+
+        self.sidebar = ctk.CTkFrame(
+            self,
+            width=360,
+            fg_color=self.SIDEBAR,
+            corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
+            bg_color=self.BG,
+        )
+        self.sidebar.grid(row=1, column=0, sticky="ns", padx=(16, 8), pady=(0, 16))
+
+        self.content = ctk.CTkFrame(
+            self,
+            fg_color=self.BG,
+            corner_radius=self.CORNER_RADIUS,
+            bg_color=self.BG,
+            #border_width=1,
+            #border_color="#1a3a7a",
+        )
+        self.content.grid(
+            row=1,
+            column=1,
+            sticky="nsew",
+            padx=(8, 16),
+            pady=(0, 16),
+        )
+        self.content.grid_rowconfigure(1, weight=1)
+        self.content.grid_rowconfigure(2, weight=1)
+        self.content.grid_columnconfigure(0, weight=1)
+
+        self._build_sidebar()
+        self._build_preview()
+        self._build_result()
+
+    def _build_header(self) -> None:
+        header = ctk.CTkFrame(
+            self,
+            fg_color=self.SIDEBAR,
+            height=124,
+            corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
+            bg_color=self.BG,
+        )
+        header.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=16,
+            pady=(12, 12),
+        )
+        header.grid_columnconfigure(0, weight=0)
+        header.grid_columnconfigure(1, weight=1)
+        header.grid_columnconfigure(2, weight=0)
+
+        logo_path = Path(__file__).parent / "logo.png"
+        left_frame = ctk.CTkFrame(header, fg_color=self.SIDEBAR, corner_radius=0)
+        left_frame.grid(row=0, column=0, sticky="w", padx=(18, 8), pady=12)
+        left_frame.grid_columnconfigure(0, weight=0)
+        left_frame.grid_columnconfigure(1, weight=0)
+
+        if logo_path.exists():
+            try:
+                logo_img = Image.open(logo_path).convert("RGBA")
+                scale = 8
+                circle_size = 56 * scale
+
+                logo_img = logo_img.resize((40 * scale, 40 * scale), Image.LANCZOS)
+
+                circle = Image.new("RGBA", (circle_size, circle_size), (0, 0, 0, 0))
+                mask = Image.new("L", (circle_size, circle_size), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, circle_size, circle_size), fill=255)
+                white = Image.new("RGBA", (circle_size, circle_size), (255, 255, 255, 255))
+                circle.paste(white, mask=mask)
+
+                offset = ((circle_size - logo_img.width) // 2, (circle_size - logo_img.height) // 2)
+                circle.paste(logo_img, offset, logo_img)
+                circle = circle.resize((56, 56), Image.LANCZOS)
+
+                self._logo_image = ctk.CTkImage(circle, size=(56, 56))
+                logo_label = ctk.CTkLabel(left_frame, image=self._logo_image, text="", fg_color="transparent")
+                logo_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+                logo_label.bind("<ButtonPress-1>", self.start_move)
+            except Exception:
+                pass
+        else:
+            logo_bg = ctk.CTkFrame(
+                left_frame,
+                width=48,
+                height=48,
+                fg_color=self.BTN,
+                corner_radius=28,
+            )
+            logo_bg.grid(row=0, column=0, sticky="w", padx=(0, 8))
+            logo_bg.grid_propagate(False)
+
+            logo_label = ctk.CTkLabel(
+                logo_bg,
+                text="G",
+                font=("Arial Bold", 18),
+                text_color="#ffffff",
+            )
+            logo_label.place(relx=0.5, rely=0.5, anchor="center")
+            logo_bg.bind("<ButtonPress-1>", self.start_move)
+            logo_label.bind("<ButtonPress-1>", self.start_move)
+
+        title = ctk.CTkLabel(
+            left_frame,
+            text="G-Vision",
+            font=("Arial Bold", 24),
+            text_color=self.TEXT,
+        )
+        title.grid(row=0, column=1, sticky="w")
+        title.bind("<ButtonPress-1>", self.start_move)
+        title.bind("<B1-Motion>", self.move_window)
+
+        self.progress_container = ctk.CTkFrame(
+            header,
+            fg_color=self.BTN,
+            corner_radius=26,
+            border_width=1,
+            border_color="#2a52c0",
+        )
+        progress_container = self.progress_container
+        progress_container.grid(row=0, column=1, sticky="ew", padx=8, pady=12)
+        progress_container.grid_propagate(False)
+        progress_container.configure(height=42)
+
+        self.header_status_label = ctk.CTkLabel(
+            progress_container,
+            text="Готов",
+            text_color=self.SUBTEXT,
+            font=("Arial Bold", 13),
+        )
+        self.header_status_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.header_status_label.bind("<Button-1>", self._on_model_status_click)
+
+        close_img = Image.open(Path(__file__).parent / "x.png").convert("RGBA")
+        self._close_image = ctk.CTkImage(close_img, size=(14, 14))
+        self.close_button = ctk.CTkButton(
+            header,
+            image=self._close_image,
+            text="",
+            width=44,
+            height=44,
+            corner_radius=22,
+            fg_color=self.BTN,
+            hover_color=self.BTN_HOVER,
+            border_width=1,
+            border_color="#2a52c0",
+            command=self.close,
+        )
+        self.close_button.grid(row=0, column=2, sticky="e", padx=16, pady=12)
+
+    def _build_sidebar(self) -> None:
+        self.btn_load = self.make_btn("Загрузить изображение", self.load_image)
+        self.btn_load.pack(fill="x", padx=20, pady=(20, 8))
+
+        self.btn_run = self.make_btn("Распознать текст", self.recognize)
+        self.btn_run.pack(fill="x", padx=20, pady=8)
+
+        self.btn_clear = self.make_btn("Очистить", self.clear_all, red=True)
+        self.btn_clear.pack(fill="x", padx=20, pady=(8, 20))
+
+        history_title = ctk.CTkLabel(
+            self.sidebar,
+            text="История",
+            font=("Arial Bold", 16),
+            text_color=self.SUBTEXT,
+        )
+        history_title.pack(anchor="w", padx=24, pady=(0, 8))
+
+        history_outer = ctk.CTkFrame(
+            self.sidebar,
+            fg_color=self.INPUT,
+            corner_radius=24,
+            border_width=1,
+            border_color="#1a3a7a",
+        )
+        history_outer.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self._history_canvas = tk.Canvas(
+            history_outer,
+            bg=self.INPUT,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self._history_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+
+        history_scroll = RoundScrollbar(
+            history_outer,
+            orient="vertical",
+            command=self._history_canvas.yview,
+            width=8,
+        )
+        history_scroll.pack(side="right", fill="y", pady=8, padx=(0, 6))
+        self._history_canvas.configure(yscrollcommand=history_scroll.set)
+
+        self._history_frame = tk.Frame(self._history_canvas, bg=self.INPUT)
+        self._history_canvas_window = self._history_canvas.create_window(
+            (0, 0), window=self._history_frame, anchor="nw"
+        )
+
+        self._history_frame.bind("<Configure>", self._on_history_resize)
+        self._history_canvas.bind("<Configure>", self._on_history_canvas_resize)
+        self._history_canvas.bind("<MouseWheel>", lambda e: self._history_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    def _draw_canvas_corners(self, canvas, bg_color, radius=24):
+        def redraw(event=None):
+            canvas.delete("corners")
+            w = canvas.winfo_width()
+            h = canvas.winfo_height()
+            if w < 2 or h < 2:
+                return
+            r = radius
+
+            for x, y, ax, ay in [
+                (0, 0, 0, 0),
+                (w, 0, 1, 0),
+                (0, h, 0, 1),
+                (w, h, 1, 1),
+            ]:
+                canvas.create_arc(
+                    x - r * (1 - 2*ax), y - r * (1 - 2*ay),
+                    x + r * (2*ax - 0) if ax == 0 else x - r,
+                    y + r if ay == 0 else y - r,
+                    start=[180, 270, 90, 0][int(ax*2 + ay)],
+                    extent=90,
+                    fill=bg_color,
+                    outline=bg_color,
+                    tags="corners",
+                )
+        canvas.bind("<Configure>", lambda e: redraw())
+        redraw()
+
+    def _build_preview(self) -> None:
+        self.preview_card = ctk.CTkFrame(
+            self.content,
+            fg_color=self.PANEL,
+            corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
+        )
+        self.preview_card.grid(row=1, column=0, sticky="nsew", pady=(0, 16))
+        self.preview_card.grid_rowconfigure(1, weight=1)
+        self.preview_card.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            self.preview_card,
+            text="Изображение",
+            font=("Arial Bold", 24),
+            text_color=self.TEXT,
+        )
+        title.pack(anchor="w", padx=24, pady=20)
+
+        outer = ctk.CTkFrame(
+            self.preview_card,
+            fg_color=self.INPUT,
+            corner_radius=self.CORNER_RADIUS,
+        )
+        outer.pack(expand=True, fill="both", padx=20, pady=(0, 24))
+
+        self.preview_canvas = tk.Canvas(
+            outer,
+            bg=self.INPUT,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+
+        v_scroll = RoundScrollbar(outer, orient="vertical",
+            command=self.preview_canvas.yview, width=8)
+        h_scroll = RoundScrollbar(outer, orient="horizontal",
+            command=self.preview_canvas.xview, height=8)
+
+        self.preview_canvas.configure(
+            yscrollcommand=v_scroll.set,
+            xscrollcommand=h_scroll.set,
+        )
+
+        h_scroll.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
+        v_scroll.pack(side="right", fill="y", pady=16, padx=(0, 8))
+        self.preview_canvas.pack(expand=True, fill="both", padx=(16, 0), pady=16)
+        self._draw_canvas_corners(self.preview_canvas, self.INPUT)
+        self.preview_canvas.bind("<MouseWheel>", lambda e: self.preview_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        self.preview_canvas.bind("<Shift-MouseWheel>", lambda e: self.preview_canvas.xview_scroll(-1 * (e.delta // 120), "units"))
+
+    def _build_result(self) -> None:
+        self.result_card = ctk.CTkFrame(
+            self.content,
+            fg_color=self.PANEL,
+            corner_radius=self.CORNER_RADIUS,
+            border_width=1,
+            border_color="#1a3a7a",
+        )
+        self.result_card.grid(row=2, column=0, sticky="nsew")
+        self.result_card.grid_rowconfigure(1, weight=1)
+        self.result_card.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            self.result_card,
+            text="Распознанный текст",
+            font=("Arial Bold", 24),
+            text_color=self.TEXT,
+        )
+        title.pack(anchor="w", padx=24, pady=20)
+
+        self.result = ctk.CTkTextbox(
+            self.result_card,
+            fg_color=self.INPUT,
+            font=("Arial", 16),
+            corner_radius=28,
+            border_width=1,
+            border_color="#1a3a7a",
+        )
+        self.result.pack(expand=True, fill="both", padx=20)
+
+        self.copy_btn = ctk.CTkButton(
+            self.result_card,
+            text="Копировать текст",
+            fg_color=self.BTN,
+            hover_color=self.BTN_HOVER,
+            border_width=1,
+            border_color="#2a52c0",
+            command=self.copy_text,
+            width=220,
+            height=48,
+            corner_radius=28,
+        )
+        self.copy_btn.pack(anchor="e", padx=20, pady=18)
+
+    def make_btn(self, text: str, cmd, red: bool = False) -> ctk.CTkButton:
+        if red:
+            return ctk.CTkButton(
+                self.sidebar,
+                text=text,
+                height=56,
+                font=("Arial Bold", 16),
+                fg_color="#ffffff",
+                text_color=self.BTN,
+                hover_color="#dee8ff",
+                border_width=2,
+                border_color=self.BTN,
+                command=cmd,
+                corner_radius=28,
+            )
+
+        return ctk.CTkButton(
+            self.sidebar,
+            text=text,
+            height=56,
+            font=("Arial Bold", 16),
+            fg_color=self.BTN,
+            hover_color=self.BTN_HOVER,
+            border_width=1,
+            border_color="#2a52c0",
+            command=cmd,
+            corner_radius=28,
+        )
+
+    def _on_model_status_click(self, event=None):
+        if not self._model_path.exists():
+            self.choose_model_file()
+
+    def choose_model_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            filetypes=[("PyTorch модели", "*.pt *.pth"), ("Все файлы", "*.*")]
+        )
+        if file_path:
+            self._model_path = Path(file_path)
+            self._init_ocr()
+
+    def recognize(self) -> None:
+        if not self._ocr:
+            self.update_status("Модель не загружена - выберите нажав на линию прогресса", self.RED)
+            return
+        if not self._image_path:
+            self.update_status("Сначала загрузите изображение", self.RED)
+            return
+
+        self._processing_animation_active = True
+        self._processing_dots = 0
+        self._glow_phase = 0.0
+        self.update_status("Разглядываю изображение...", self.TEXT)
+        self._animate_processing()
+        self._animate_progress_glow()
+        self.executor.submit(self._worker)
+
+    def _worker(self) -> None:
+        try:
+            result = self._ocr.recognize(str(self._image_path))
+            text = result.get("text", "")
+            self.after(0, lambda: self._show_result(text))
+        except Exception as error:
+            self.after(0, lambda: self.update_status(f"Ошибка распознавания: {error}", self.RED))
+        finally:
+            self.after(0, self._finish_processing)
+
+    def _animate_processing(self) -> None:
+        if not self._processing_animation_active:
+            return
+        phrases = [
+            "Разглядываю изображение...",
+            "Ищу буквы...",
+            "Перевожу в текст...",
+            "Формирую результат...",
+        ]
+        self._processing_dots = (self._processing_dots + 1) % len(phrases)
+        self.header_status_label.configure(text=phrases[self._processing_dots])
+        self.after(700, self._animate_processing)
+
+    def _finish_processing(self) -> None:
+        self._processing_animation_active = False
+        self.update_status("Распознавание завершено", self.GREEN)
+
+    def _lerp_color(self, c1: str, c2: str, t: float) -> str:
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _animate_progress_glow(self) -> None:
+        if not self._processing_animation_active:
+            try:
+                self.progress_container.configure(fg_color=self.BTN, border_color="#2a52c0")
+            except Exception:
+                pass
+            return
+        t = (math.sin(self._glow_phase) + 1) / 2
+        self._glow_phase = (self._glow_phase + 0.12) % (2 * math.pi)
+        color = self._lerp_color(self.BTN, "#3060e0", t)
+        border = self._lerp_color("#2a52c0", "#4a7aff", t)
+        try:
+            self.progress_container.configure(fg_color=color, border_color=border)
+        except Exception:
+            pass
+        self.after(40, self._animate_progress_glow)
+
+    def _on_history_resize(self, event):
+        self._history_canvas.configure(scrollregion=self._history_canvas.bbox("all"))
+
+    def _on_history_canvas_resize(self, event):
+        self._history_canvas.itemconfig(self._history_canvas_window, width=event.width)
+
+    def _add_history_item(self, text: str) -> None:
+        preview = text.strip()[:60].replace("\n", " ")
+        if len(text.strip()) > 60:
+            preview += "..."
+
+        item_frame = tk.Frame(self._history_frame, bg=self.INPUT)
+        item_frame.pack(fill="x", padx=4, pady=4)
+
+        item_canvas = tk.Canvas(
+            item_frame,
+            bg=self.INPUT,
+            highlightthickness=0,
+            borderwidth=0,
+            height=64,
+        )
+        item_canvas.pack(fill="x")
+
+        def draw_item(event, canvas=item_canvas, t=preview):
+            w = canvas.winfo_width()
+            canvas.delete("all")
+            r = 16
+            canvas.create_polygon(
+                r, 0, w-r, 0, w, 0, w, r,
+                w, 64-r, w, 64, w-r, 64,
+                r, 64, 0, 64, 0, 64-r,
+                0, r, 0, 0,
+                smooth=True, fill="#1e3a6e",
+            )
+            canvas.create_text(12, 32, text=t, fill=self.TEXT,
+                font=("Arial", 11), anchor="w", width=w-24)
+
+        def on_click(event, full=text):
+            self._show_result(full)
+
+        def on_enter(event, canvas=item_canvas, t=preview):
+            w = canvas.winfo_width()
+            canvas.delete("all")
+            r = 16
+            canvas.create_polygon(
+                r, 0, w-r, 0, w, 0, w, r,
+                w, 64-r, w, 64, w-r, 64,
+                r, 64, 0, 64, 0, 64-r,
+                0, r, 0, 0,
+                smooth=True, fill="#2a50cf",
+            )
+            canvas.create_text(12, 32, text=t, fill="#ffffff",
+                font=("Arial", 11), anchor="w", width=w-24)
+
+        def on_leave(event, canvas=item_canvas, t=preview):
+            w = canvas.winfo_width()
+            canvas.delete("all")
+            r = 16
+            canvas.create_polygon(
+                r, 0, w-r, 0, w, 0, w, r,
+                w, 64-r, w, 64, w-r, 64,
+                r, 64, 0, 64, 0, 64-r,
+                0, r, 0, 0,
+                smooth=True, fill="#1e3a6e",
+            )
+            canvas.create_text(12, 32, text=t, fill=self.TEXT,
+                font=("Arial", 11), anchor="w", width=w-24)
+
+        item_canvas.bind("<Configure>", draw_item)
+        item_canvas.bind("<Button-1>", on_click)
+        item_canvas.bind("<Enter>", on_enter)
+        item_canvas.bind("<Leave>", on_leave)
+
+        self._history_items.append(item_frame)
+        self._history_canvas.yview_moveto(1.0)
+
+    def _show_result(self, text: str) -> None:
+        self.result.delete("1.0", "end")
+        self.result.insert("1.0", text)
+        self.update_status("Текст успешно распознан", self.GREEN)
+        self._add_history_item(text)
+
+    def copy_text(self) -> None:
+        text = self.result.get("1.0", "end").strip()
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_status("Текст скопирован в буфер", self.GREEN)
+
+    def clear_all(self) -> None:
+        self.preview_canvas.delete("all")
+        self._canvas_image_ref = None
+        self._image_path = None
+        self.result.delete("1.0", "end")
+        self.update_status("Жду новое изображение", self.GREEN)
+
+    def load_image(self) -> None:
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp")]
+        )
+        if not file_path:
+            return
+
+        self._image_path = Path(file_path)
+        image = Image.open(file_path).convert("RGB")
+
+        radius = min(32, min(image.size) // 8)
+        rounded = self._make_rounded_image(image, radius=radius)
+
+        self._canvas_image_ref = ImageTk.PhotoImage(rounded)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(0, 0, image=self._canvas_image_ref, anchor="nw")
+        self.preview_canvas.configure(scrollregion=(0, 0, rounded.width, rounded.height))
+
+        self.update_status("Изображение загружено", self.TEXT)
+
+    def _init_ocr(self) -> None:
+        if not self._model_path.exists():
+            self.update_status(
+                f"Модель не найдена: {self._model_path.name} — нажмите сюда и выберите файл модели",
+                self.RED,
+            )
+            self._ocr = None
+            return
+
+        try:
+            self._ocr = GVisionOCR(
+                str(self._model_path),
+                device=self._device,
+                use_compile=self._use_compile,
+            )
+            self.update_status(f"Модель загружена: {self._model_path.name}", self.TEXT)
+        except Exception as error:
+            self._ocr = None
+            self.update_status(f"Ошибка загрузки OCR: {error}", self.RED)
+
+    def _make_rounded_image(self, image: Image.Image, radius: int) -> Image.Image:
+        image = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0, image.width, image.height), radius=radius, fill=255)
+        image.putalpha(mask)
+
+        rounded = Image.new("RGBA", image.size, self.INPUT)
+        rounded.paste(image, (0, 0), image)
+        return rounded
+
+    def update_status(self, text: str, text_color: Optional[str] = None) -> None:
+        try:
+            self.header_status_label.configure(
+                text=text,
+                text_color=text_color or self.SUBTEXT,
+            )
+        except Exception:
+            pass
+
+    def start_move(self, event) -> None:
+        self._drag_position = (event.x_root, event.y_root)
+
+    def move_window(self, event) -> None:
+        if self._drag_position is None:
+            return
+        delta_x = event.x_root - self._drag_position[0]
+        delta_y = event.y_root - self._drag_position[1]
+        x = self.winfo_x() + delta_x
+        y = self.winfo_y() + delta_y
+        self.geometry(f"+{x}+{y}")
+        self._drag_position = (event.x_root, event.y_root)
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=False)
+        self.destroy()
+
+
 if __name__ == "__main__":
-    Orchestrator().execute()
+    app = App()
+    app.mainloop()
