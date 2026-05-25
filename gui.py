@@ -7,7 +7,8 @@ from pathlib import Path
 from tkinter import filedialog
 from typing import Dict, List, Optional, Tuple
 import tkinter as tk
-
+import json
+from datetime import datetime
 
 import customtkinter as ctk
 import torch
@@ -364,7 +365,8 @@ class App(ctk.CTk):
 
     WIDTH: int = 1400
     HEIGHT: int = 920
-
+    HISTORY_FILE: str = "gvision_history.json"
+    MAX_HISTORY_ITEMS: int = 100
 
     BG: str = "#020208"
     SIDEBAR: str = "#0a1a4b"
@@ -388,14 +390,15 @@ class App(ctk.CTk):
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(1100, 760)
         self.title("G-Vision")
-
+        self._set_window_icon() 
+        
         if platform.system() == "Windows":
             self.configure(fg_color=self.TRANSPARENT)
         else:
             self.configure(fg_color=self.BG)
 
         self._apply_window_rounding()
-
+        self.iconbitmap("logoC.ico")
         self._image_path: Optional[Path] = None
         self._ocr: Optional[GVisionOCR] = None
         self._drag_position: Optional[Tuple[int, int]] = None
@@ -432,6 +435,28 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+    
+    def _set_window_icon(self) -> None:
+        icon_path = Path(__file__).parent / "logoC.ico"
+        icon_png = Path(__file__).parent / "logoC.png"  
+        
+        system = platform.system()
+        
+        if system == "Windows":
+            if icon_path.exists():
+                try:
+                    self.iconbitmap(str(icon_path))
+                except Exception:
+                    pass
+        else:
+            icon_candidate = icon_png if icon_png.exists() else icon_path
+            if icon_candidate.exists():
+                try:
+                    icon = tk.PhotoImage(file=str(icon_candidate))
+                    self.tk.call("wm", "iconphoto", self._w, icon)
+                    self._icon_ref = icon
+                except Exception:
+                    pass
 
     def _build(self) -> None:
         system = platform.system()
@@ -493,6 +518,7 @@ class App(ctk.CTk):
         self._build_sidebar()
         self._build_preview()
         self._build_result()
+        self._load_history()
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(
@@ -679,6 +705,54 @@ class App(ctk.CTk):
                 -1 * (e.delta // 120), "units"
             ),
         )
+
+    def _get_history_path(self) -> Path:
+        return Path(__file__).parent / self.HISTORY_FILE
+
+    def _load_history(self) -> None:
+        history_path = self._get_history_path()
+        if not history_path.exists():
+            return
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            for item in reversed(items[-20:]): 
+                self._add_history_item(item["text"], save_to_file=False)
+        except Exception as e:
+            self.update_status(f"Ошибка загрузки истории: {e}", self.RED)
+
+    def _save_history_item(self, text: str) -> None:
+        history_path = self._get_history_path()
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "text": text,
+            "preview": text.strip()[:60].replace("\n", " ")
+        }
+        
+        items = []
+        if history_path.exists():
+            try:
+                with open(history_path, "r", encoding="utf-8") as f:
+                    items = json.load(f)
+            except Exception:
+                items = []
+
+        items.append(record)
+        items = items[-self.MAX_HISTORY_ITEMS:]
+
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+    def _clear_history_file(self) -> None:
+        history_path = self._get_history_path()
+        if history_path.exists():
+            try:
+                history_path.unlink()
+                for item in self._history_items:
+                    item.destroy()
+                self._history_items.clear()
+            except Exception as e:
+                self.update_status(f"Ошибка очистки истории: {e}", self.RED)
 
     def _build_preview(self) -> None:
         self.preview_card = ctk.CTkFrame(
@@ -962,7 +1036,7 @@ class App(ctk.CTk):
             self._history_canvas_window, width=event.width
         )
 
-    def _add_history_item(self, text: str) -> None:
+    def _add_history_item(self, text: str, save_to_file: bool = True) -> None:
         preview = text.strip()[:60].replace("\n", " ")
         if len(text.strip()) > 60:
             preview += "..."
@@ -978,7 +1052,6 @@ class App(ctk.CTk):
             height=64,
         )
         item_canvas.pack(fill="x")
-
 
         state = {"fill": "#1e3a6e"}
 
@@ -1001,7 +1074,6 @@ class App(ctk.CTk):
                 font=("Arial", 11), anchor="w", width=w - 24,
             )
 
-
         item_canvas.bind(
             "<Configure>",
             lambda e, c=item_canvas, t=preview: draw(c, t, state["fill"]),
@@ -1022,12 +1094,14 @@ class App(ctk.CTk):
 
         self._history_items.append(item_frame)
 
-
         self._history_frame.update_idletasks()
         self._history_canvas.configure(
             scrollregion=self._history_canvas.bbox("all")
         )
         self._history_canvas.yview_moveto(1.0)
+
+        if save_to_file:
+            self._save_history_item(text)
 
 
     def _display_text(self, text: str) -> None:
