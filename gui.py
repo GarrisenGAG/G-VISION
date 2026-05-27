@@ -1,5 +1,14 @@
+import sys
+
+def resource_path(relative_path: str) -> Path:
+    try:
+        base_path = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    except Exception:
+        base_path = Path(__file__).parent
+    return base_path / relative_path
 import math
 import platform
+import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -366,6 +375,7 @@ class App(ctk.CTk):
     WIDTH: int = 1400
     HEIGHT: int = 920
     HISTORY_FILE: str = "gvision_history.json"
+    MODEL_CONFIG_FILE: str = "gvision_model.json"
     MAX_HISTORY_ITEMS: int = 100
 
     BG: str = "#020208"
@@ -389,7 +399,7 @@ class App(ctk.CTk):
         self.overrideredirect(True)
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.minsize(1100, 760)
-        self.title("G-Vision")
+        self.title("G-VISION")
         self._set_window_icon() 
         
         if platform.system() == "Windows":
@@ -398,21 +408,22 @@ class App(ctk.CTk):
             self.configure(fg_color=self.BG)
 
         self._apply_window_rounding()
-        self.iconbitmap("logoC.ico")
+        self._set_window_icon()
         self._image_path: Optional[Path] = None
         self._ocr: Optional[GVisionOCR] = None
         self._drag_position: Optional[Tuple[int, int]] = None
         self._processing_animation_active: bool = False
         self._processing_dots: int = 0
         self._glow_phase: float = 0.0
+        self._job_id: int = 0
         self._canvas_image_ref = None
         self._history_items: list = []
 
         self.executor = ThreadPoolExecutor(max_workers=1)
-        self._model_path: Path = Path(__file__).parent / "G-Vision 13m.pt"
         self._device: str = "auto"
         self._use_compile: bool = False
 
+        self._load_model_path()
         self._build()
         self._init_ocr()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -435,10 +446,16 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
-    
+    def get_resource_path(relative: str) -> Path:
+        if getattr(sys, 'frozen', False):
+            base = Path(sys._MEIPASS)
+        else:
+            base = Path(__file__).parent
+        return base / relative
+        
     def _set_window_icon(self) -> None:
-        icon_path = Path(__file__).parent / "logoC.ico"
-        icon_png = Path(__file__).parent / "logoC.png"  
+        icon_path = resource_path("logoC.ico")
+        icon_png = resource_path("logoC.png")
         
         system = platform.system()
         
@@ -547,7 +564,7 @@ class App(ctk.CTk):
 
         title = ctk.CTkLabel(
             left_frame,
-            text="G-Vision",
+            text="G-VISION",
             font=("Arial Bold", 24),
             text_color=self.TEXT,
         )
@@ -708,6 +725,31 @@ class App(ctk.CTk):
 
     def _get_history_path(self) -> Path:
         return Path(__file__).parent / self.HISTORY_FILE
+
+    def _get_model_config_path(self) -> Path:
+        return resource_path(self.MODEL_CONFIG_FILE)
+
+    def _load_model_path(self) -> None:
+        config_path = self._get_model_config_path()
+        if config_path.exists():
+            try:
+                with open(config_path, "r") as f:
+                    data = json.load(f)
+                    model_path = data.get("model_path")
+                    if model_path:
+                        self._model_path = Path(model_path)
+            except Exception:
+                self._model_path = resource_path("G-Vision 13m.pt")
+        else:
+            self._model_path = resource_path("G-Vision 13m.pt")
+
+    def _save_model_path(self) -> None:
+        config_path = self._get_model_config_path()
+        try:
+            with open(config_path, "w") as f:
+                json.dump({"model_path": str(self._model_path)}, f)
+        except Exception:
+            pass
 
     def _load_history(self) -> None:
         history_path = self._get_history_path()
@@ -954,28 +996,31 @@ class App(ctk.CTk):
             self.update_status("Сначала загрузите изображение", self.RED)
             return
 
+        self._job_id += 1
+        current_job = self._job_id
         self._processing_animation_active = True
-        self._processing_dots = 0
         self._glow_phase = 0.0
-        self.update_status("Разглядываю изображение...", self.TEXT)
-        self._animate_processing()
+        self.update_status("Распознавание...", self.TEXT)
         self._animate_progress_glow()
-        self.executor.submit(self._worker)
+        # форсируем отрисовку статуса до блокировки главного треда
+        self.update_idletasks()
+        self._run_sync(current_job)
 
-    def _worker(self) -> None:
+    def _run_sync(self, job_id: int) -> None:
+        if job_id != self._job_id:
+            self._finish_processing()
+            return
         try:
             result = self._ocr.recognize(str(self._image_path))
             text = result.get("text", "")
-            self.after(0, lambda: self._show_result(text))
+            self._show_result(text)
         except Exception as error:
-            self.after(
-                0,
-                lambda: self.update_status(
-                    f"Ошибка распознавания: {error}", self.RED
-                ),
-            )
+            import traceback
+            full = traceback.format_exc()
+            self.update_status(str(error)[:120], self.RED)
+            print(full, flush=True)
         finally:
-            self.after(0, self._finish_processing)
+            self._finish_processing()
 
 
     def _animate_processing(self) -> None:
@@ -1122,6 +1167,8 @@ class App(ctk.CTk):
         self.update_status("Текст скопирован в буфер", self.GREEN)
 
     def clear_all(self) -> None:
+        self._job_id += 1
+        self._processing_animation_active = False
         self.preview_canvas.delete("all")
         self._canvas_image_ref = None
         self._image_path = None
@@ -1157,6 +1204,7 @@ class App(ctk.CTk):
         )
         if file_path:
             self._model_path = Path(file_path)
+            self._save_model_path()
             self._init_ocr()
 
     def _make_rounded_image(
